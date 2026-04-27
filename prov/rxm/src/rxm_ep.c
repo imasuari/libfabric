@@ -585,7 +585,9 @@ void rxm_ep_progress_deferred_queue(struct rxm_ep *rxm_ep,
 			break;
 		case RXM_DEFERRED_TX_RNDV_READ:
 			ret = rxm_ep->rndv_ops->xfer(
-				def_tx_entry->rxm_conn->msg_ep,
+				rxm_conn_msg_ep(def_tx_entry->rxm_conn,
+					       RXM_OP_RNDV_RMA,
+					       def_tx_entry->rndv_read.rx_buf->pkt.ctrl_hdr.msg_id),
 				def_tx_entry->rndv_read.rxm_iov.iov,
 				def_tx_entry->rndv_read.rxm_iov.desc,
 				def_tx_entry->rndv_read.rxm_iov.count, 0,
@@ -603,7 +605,9 @@ void rxm_ep_progress_deferred_queue(struct rxm_ep *rxm_ep,
 			break;
 		case RXM_DEFERRED_TX_RNDV_WRITE:
 			ret = rxm_ep->rndv_ops->xfer(
-				def_tx_entry->rxm_conn->msg_ep,
+				rxm_conn_msg_ep(def_tx_entry->rxm_conn,
+					       RXM_OP_RNDV_RMA,
+					       def_tx_entry->rndv_write.tx_buf->pkt.ctrl_hdr.msg_id),
 				def_tx_entry->rndv_write.rxm_iov.iov,
 				def_tx_entry->rndv_write.rxm_iov.desc,
 				def_tx_entry->rndv_write.rxm_iov.count, 0,

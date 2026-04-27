@@ -587,7 +587,9 @@ ssize_t rxm_rndv_read(struct rxm_rx_buf *rx_buf)
 	rx_buf->peer_entry->msg_size = total_len;
 	RXM_UPDATE_STATE(FI_LOG_CQ, rx_buf, RXM_RNDV_READ);
 
-	ret = rxm_rndv_xfer(rx_buf->ep, rx_buf->conn->msg_ep,
+	ret = rxm_rndv_xfer(rx_buf->ep,
+			    rxm_conn_msg_ep(rx_buf->conn, RXM_OP_RNDV_RMA,
+					   rx_buf->pkt.ctrl_hdr.msg_id),
 			    rx_buf->remote_rndv_hdr,
 			    rx_buf->peer_entry->iov,
 			    rx_buf->peer_entry->desc,
@@ -653,7 +655,11 @@ static ssize_t rxm_rndv_handle_wr_data(struct rxm_rx_buf *rx_buf)
 	else
 		RXM_UPDATE_STATE(FI_LOG_CQ, tx_buf, RXM_RNDV_WRITE_TX_WAIT);
 
-	ret = rxm_rndv_xfer(rx_buf->ep, tx_buf->write_rndv.conn->msg_ep, rx_hdr,
+	ret = rxm_rndv_xfer(rx_buf->ep,
+			    rxm_conn_msg_ep(tx_buf->write_rndv.conn,
+					   RXM_OP_RNDV_RMA,
+					   tx_buf->pkt.ctrl_hdr.msg_id),
+			    rx_hdr,
 			    tx_buf->write_rndv.iov, tx_buf->write_rndv.desc,
 			    tx_buf->rma.count, total_len, tx_buf);
 
