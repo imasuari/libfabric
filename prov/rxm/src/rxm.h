@@ -57,6 +57,8 @@
 #include <ofi_iov.h>
 #include <ofi_hmem.h>
 
+#include "rxm_qp_selector.h"
+
 #ifndef _RXM_H_
 #define _RXM_H_
 
@@ -233,6 +235,8 @@ struct rxm_conn {
 	struct fid_ep *msg_ep;
 	struct fid_ep **msg_eps;
 	uint8_t num_msg_eps;
+	const struct rxm_qp_selector *selector;
+	void *selector_state;
 	struct rxm_ep *ep;
 
 	/* Prior versions of libfabric did not guarantee that all connections

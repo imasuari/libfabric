@@ -79,6 +79,10 @@ static void rxm_close_conn(struct rxm_conn *conn)
 		rx_entry = (struct fi_peer_rx_entry*)conn->deferred_sar_msgs.next;
 		rx_entry->srx->owner_ops->free_entry(rx_entry);
 	}
+	assert(conn->selector);
+	conn->selector->fini(conn, conn->selector_state);
+	conn->selector_state = NULL;
+
 	for (int i = 0; i < conn->num_msg_eps; i++) {
 		if (conn->msg_eps && conn->msg_eps[i])
 			fi_close(&conn->msg_eps[i]->fid);
@@ -231,6 +235,16 @@ static int rxm_open_conn(struct rxm_conn *conn, struct fi_info *msg_info)
 	}
 	conn->msg_eps[0] = msg_ep;
 	conn->msg_ep = msg_ep;
+
+	assert(conn->selector);
+	ret = conn->selector->init(conn, &conn->selector_state);
+	if (ret) {
+		RXM_WARN_ERR(FI_LOG_EP_CTRL, "selector init", ret);
+		free(conn->msg_eps);
+		conn->msg_eps = NULL;
+		conn->msg_ep = NULL;
+		goto err;
+	}
 	return 0;
 err:
 	fi_close(&msg_ep->fid);
@@ -311,6 +325,9 @@ static int rxm_send_connect(struct rxm_conn *conn)
 	return 0;
 
 err:
+	assert(conn->selector);
+	conn->selector->fini(conn, conn->selector_state);
+	conn->selector_state = NULL;
 	for (int i = 0; i < conn->num_msg_eps; i++) {
 		if (conn->msg_eps && conn->msg_eps[i])
 			fi_close(&conn->msg_eps[i]->fid);
@@ -429,6 +446,8 @@ rxm_alloc_conn(struct rxm_ep *ep, struct util_peer_addr *peer)
 
 	conn->num_msg_eps = 1;
 	conn->msg_eps = NULL;
+	conn->selector = &rxm_selector_single_qp;
+	conn->selector_state = NULL;
 
 	FI_DBG(&rxm_prov, FI_LOG_EP_CTRL, "allocated conn %p\n", conn);
 	return conn;
