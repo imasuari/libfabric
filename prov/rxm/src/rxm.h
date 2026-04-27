@@ -792,6 +792,23 @@ static inline size_t rxm_ep_max_atomic_size(struct fi_info *info)
 	return rxm_buffer_size - sizeof(struct rxm_atomic_hdr);
 }
 
+/* Pick the msg_ep index to use for a TX op on this conn. The selector
+ * is pluggable (see rxm_qp_selector.h); single_qp always returns 0.
+ */
+static inline struct fid_ep *
+rxm_conn_msg_ep(struct rxm_conn *conn, enum rxm_op_type op,
+	       uint64_t msg_id)
+{
+	struct rxm_selector_ctx ctx = {
+		.op = op,
+		.msg_id = msg_id,
+	};
+	uint8_t idx = conn->selector->select(conn, conn->selector_state, &ctx);
+
+	assert(idx < conn->num_msg_eps);
+	return conn->msg_eps[idx];
+}
+
 static inline ssize_t
 rxm_atomic_send_respmsg(struct rxm_ep *rxm_ep, struct rxm_conn *conn,
 			struct rxm_tx_buf *resp_buf, ssize_t len)
