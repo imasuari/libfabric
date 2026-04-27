@@ -538,7 +538,9 @@ void rxm_ep_progress_deferred_queue(struct rxm_ep *rxm_ep,
 		switch (def_tx_entry->type) {
 		case RXM_DEFERRED_TX_RNDV_ACK:
 			proto_info = def_tx_entry->rndv_ack.rx_buf->proto_info;
-			ret = fi_send(def_tx_entry->rxm_conn->msg_ep,
+			ret = fi_send(rxm_conn_msg_ep(def_tx_entry->rxm_conn,
+						     RXM_OP_RNDV_CTRL,
+						     proto_info->rndv.tx_buf->pkt.ctrl_hdr.msg_id),
 				      &proto_info->rndv.tx_buf->pkt,
 				      def_tx_entry->rndv_ack.pkt_size,
 				      proto_info->rndv.tx_buf->hdr.desc,
@@ -562,7 +564,9 @@ void rxm_ep_progress_deferred_queue(struct rxm_ep *rxm_ep,
 						 RXM_RNDV_WRITE_DATA_SENT);
 			break;
 		case RXM_DEFERRED_TX_RNDV_DONE:
-			ret = fi_send(def_tx_entry->rxm_conn->msg_ep,
+			ret = fi_send(rxm_conn_msg_ep(def_tx_entry->rxm_conn,
+						     RXM_OP_RNDV_CTRL,
+						     def_tx_entry->rndv_done.tx_buf->pkt.ctrl_hdr.msg_id),
 				      &def_tx_entry->rndv_done.tx_buf->write_rndv.done_buf->pkt,
 				      sizeof(struct rxm_pkt),
 				      def_tx_entry->rndv_done.tx_buf->write_rndv.done_buf->hdr.desc,

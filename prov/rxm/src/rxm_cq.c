@@ -914,7 +914,9 @@ static void rxm_rndv_send_rd_done(struct rxm_rx_buf *rx_buf)
 	buf->pkt.ctrl_hdr.conn_id = rx_buf->conn->remote_index;
 	buf->pkt.ctrl_hdr.msg_id = rx_buf->pkt.ctrl_hdr.msg_id;
 
-	ret = fi_send(rx_buf->conn->msg_ep, &buf->pkt, sizeof(buf->pkt),
+	ret = fi_send(rxm_conn_msg_ep(rx_buf->conn, RXM_OP_RNDV_CTRL,
+				     buf->pkt.ctrl_hdr.msg_id),
+		      &buf->pkt, sizeof(buf->pkt),
 		      buf->hdr.desc, 0, rx_buf);
 	if (ret) {
 		if (ret == -FI_EAGAIN) {
@@ -969,7 +971,9 @@ rxm_rndv_send_wr_done(struct rxm_ep *rxm_ep, struct rxm_tx_buf *tx_buf)
 	buf->pkt.ctrl_hdr.conn_id = tx_buf->pkt.ctrl_hdr.conn_id;
 	buf->pkt.ctrl_hdr.msg_id = tx_buf->pkt.ctrl_hdr.msg_id;
 
-	ret = fi_send(tx_buf->write_rndv.conn->msg_ep, &buf->pkt,
+	ret = fi_send(rxm_conn_msg_ep(tx_buf->write_rndv.conn, RXM_OP_RNDV_CTRL,
+				     buf->pkt.ctrl_hdr.msg_id),
+		      &buf->pkt,
 		      sizeof(buf->pkt), buf->hdr.desc, 0, tx_buf);
 	if (ret) {
 		if (ret == -FI_EAGAIN) {
@@ -1033,7 +1037,9 @@ ssize_t rxm_rndv_send_wr_data(struct rxm_rx_buf *rx_buf)
 			  rx_buf->peer_entry->iov,
 			  rx_buf->peer_entry->count, rx_buf->mr);
 
-	ret = fi_send(rx_buf->conn->msg_ep, &buf->pkt, sizeof(buf->pkt) +
+	ret = fi_send(rxm_conn_msg_ep(rx_buf->conn, RXM_OP_RNDV_CTRL,
+				     buf->pkt.ctrl_hdr.msg_id),
+		      &buf->pkt, sizeof(buf->pkt) +
 		      sizeof(struct rxm_rndv_hdr), buf->hdr.desc, 0, rx_buf);
 	if (ret) {
 		if (ret == -FI_EAGAIN) {

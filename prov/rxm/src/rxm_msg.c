@@ -163,10 +163,14 @@ rxm_send_rndv(struct rxm_ep *rxm_ep, struct rxm_conn *rxm_conn,
 			RXM_UPDATE_STATE(FI_LOG_EP_DATA, tx_buf,
 					 RXM_RNDV_READ_DONE_WAIT);
 
-		ret = fi_inject(rxm_conn->msg_ep, &tx_buf->pkt, pkt_size, 0);
+		ret = fi_inject(rxm_conn_msg_ep(rxm_conn, RXM_OP_RNDV_CTRL,
+					       tx_buf->pkt.ctrl_hdr.msg_id),
+				&tx_buf->pkt, pkt_size, 0);
 	} else {
 		RXM_UPDATE_STATE(FI_LOG_EP_DATA, tx_buf, RXM_RNDV_TX);
-		ret = fi_send(rxm_conn->msg_ep, &tx_buf->pkt, pkt_size,
+		ret = fi_send(rxm_conn_msg_ep(rxm_conn, RXM_OP_RNDV_CTRL,
+					     tx_buf->pkt.ctrl_hdr.msg_id),
+			      &tx_buf->pkt, pkt_size,
 			      tx_buf->hdr.desc, 0, tx_buf);
 	}
 
