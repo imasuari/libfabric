@@ -231,6 +231,8 @@ struct rxm_conn {
 	enum rxm_cm_state state;
 	struct util_peer_addr *peer;
 	struct fid_ep *msg_ep;
+	struct fid_ep **msg_eps;
+	uint8_t num_msg_eps;
 	struct rxm_ep *ep;
 
 	/* Prior versions of libfabric did not guarantee that all connections

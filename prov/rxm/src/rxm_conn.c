@@ -79,9 +79,14 @@ static void rxm_close_conn(struct rxm_conn *conn)
 		rx_entry = (struct fi_peer_rx_entry*)conn->deferred_sar_msgs.next;
 		rx_entry->srx->owner_ops->free_entry(rx_entry);
 	}
-	fi_close(&conn->msg_ep->fid);
+	for (int i = 0; i < conn->num_msg_eps; i++) {
+		if (conn->msg_eps && conn->msg_eps[i])
+			fi_close(&conn->msg_eps[i]->fid);
+	}
 	rxm_flush_msg_cq(conn->ep);
 	dlist_remove_init(&conn->loopback_entry);
+	free(conn->msg_eps);
+	conn->msg_eps = NULL;
 	conn->msg_ep = NULL;
 
 	if (conn->state == RXM_CM_CONNECTING || conn->state == RXM_CM_ACCEPTING)
@@ -218,6 +223,13 @@ static int rxm_open_conn(struct rxm_conn *conn, struct fi_info *msg_info)
 			goto err;
 	}
 
+	assert(conn->num_msg_eps == 1);
+	conn->msg_eps = calloc(conn->num_msg_eps, sizeof(*conn->msg_eps));
+	if (!conn->msg_eps) {
+		ret = -FI_ENOMEM;
+		goto err;
+	}
+	conn->msg_eps[0] = msg_ep;
 	conn->msg_ep = msg_ep;
 	return 0;
 err:
@@ -299,7 +311,12 @@ static int rxm_send_connect(struct rxm_conn *conn)
 	return 0;
 
 err:
-	fi_close(&conn->msg_ep->fid);
+	for (int i = 0; i < conn->num_msg_eps; i++) {
+		if (conn->msg_eps && conn->msg_eps[i])
+			fi_close(&conn->msg_eps[i]->fid);
+	}
+	free(conn->msg_eps);
+	conn->msg_eps = NULL;
 	conn->msg_ep = NULL;
 	return ret;
 }
@@ -409,6 +426,9 @@ rxm_alloc_conn(struct rxm_ep *ep, struct util_peer_addr *peer)
 
 	conn->peer = peer;
 	rxm_ref_peer(peer);
+
+	conn->num_msg_eps = 1;
+	conn->msg_eps = NULL;
 
 	FI_DBG(&rxm_prov, FI_LOG_EP_CTRL, "allocated conn %p\n", conn);
 	return conn;
