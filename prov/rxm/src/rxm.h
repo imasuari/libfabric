@@ -824,7 +824,9 @@ rxm_atomic_send_respmsg(struct rxm_ep *rxm_ep, struct rxm_conn *conn,
 		.context = resp_buf,
 		.data = 0,
 	};
-	return fi_sendmsg(conn->msg_ep, &msg, FI_COMPLETION);
+	return fi_sendmsg(rxm_conn_msg_ep(conn, RXM_OP_ATOMIC,
+					 resp_buf->pkt.ctrl_hdr.msg_id),
+			  &msg, FI_COMPLETION);
 }
 
 void rxm_ep_progress_deferred_queue(struct rxm_ep *rxm_ep,

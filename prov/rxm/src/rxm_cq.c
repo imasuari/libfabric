@@ -1131,7 +1131,9 @@ static ssize_t rxm_atomic_send_resp(struct rxm_ep *rxm_ep,
 	atomic_hdr->result_len = htonl((uint32_t) result_len);
 
 	if (tot_len < rxm_ep->inject_limit) {
-		ret = fi_inject(rx_buf->conn->msg_ep, &resp_buf->pkt,
+		ret = fi_inject(rxm_conn_msg_ep(rx_buf->conn, RXM_OP_ATOMIC,
+					       resp_buf->pkt.ctrl_hdr.msg_id),
+				&resp_buf->pkt,
 				tot_len, 0);
 		if (!ret)
 			ofi_buf_free(resp_buf);
