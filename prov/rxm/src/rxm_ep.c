@@ -460,7 +460,10 @@ rxm_ep_progress_sar_deferred_segments(struct rxm_deferred_tx_entry *def_tx_entry
 	struct rxm_tx_buf *tx_buf = def_tx_entry->sar_seg.cur_seg_tx_buf;
 
 	if (tx_buf) {
-		ret = fi_send(def_tx_entry->rxm_conn->msg_ep, &tx_buf->pkt,
+		ret = fi_send(rxm_conn_msg_ep(def_tx_entry->rxm_conn,
+					     RXM_OP_SAR_CONT,
+					     tx_buf->pkt.ctrl_hdr.msg_id),
+			      &tx_buf->pkt,
 			      sizeof(tx_buf->pkt) + tx_buf->pkt.ctrl_hdr.seg_size,
 			      tx_buf->hdr.desc, 0, tx_buf);
 		if (ret) {

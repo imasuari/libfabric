@@ -258,7 +258,9 @@ rxm_send_segment(struct rxm_ep *rxm_ep,
 
 	*out_tx_buf = tx_buf;
 
-	return fi_send(rxm_conn->msg_ep, &tx_buf->pkt, sizeof(struct rxm_pkt) +
+	return fi_send(rxm_conn_msg_ep(rxm_conn, RXM_OP_SAR_CONT,
+				      tx_buf->pkt.ctrl_hdr.msg_id),
+		       &tx_buf->pkt, sizeof(struct rxm_pkt) +
 		       tx_buf->pkt.ctrl_hdr.seg_size, tx_buf->hdr.desc, 0, tx_buf);
 }
 
@@ -292,7 +294,9 @@ rxm_send_sar(struct rxm_ep *rxm_ep, struct rxm_conn *rxm_conn,
 
 	iov_offset += rxm_buffer_size;
 
-	ret = fi_send(rxm_conn->msg_ep, &first_tx_buf->pkt,
+	ret = fi_send(rxm_conn_msg_ep(rxm_conn, RXM_OP_SAR_FIRST,
+				     first_tx_buf->pkt.ctrl_hdr.msg_id),
+		      &first_tx_buf->pkt,
 		      sizeof(struct rxm_pkt) + first_tx_buf->pkt.ctrl_hdr.seg_size,
 		      first_tx_buf->hdr.desc, 0, first_tx_buf);
 	if (ret) {
