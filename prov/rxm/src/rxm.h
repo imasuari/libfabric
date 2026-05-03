@@ -57,10 +57,10 @@
 #include <ofi_iov.h>
 #include <ofi_hmem.h>
 
-#include "rxm_qp_selector.h"
-
 #ifndef _RXM_H_
 #define _RXM_H_
+
+#include "rxm_qp_selector.h"
 
 
 #define RXM_CM_DATA_VERSION	1
