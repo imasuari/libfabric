@@ -19,6 +19,21 @@ enum rxm_op_type {
 	RXM_OP_ATOMIC,
 };
 
+static inline const char *rxm_op_type_str(enum rxm_op_type op)
+{
+	switch (op) {
+	case RXM_OP_EAGER:      return "EAGER";
+	case RXM_OP_SAR_FIRST:  return "SAR_FIRST";
+	case RXM_OP_SAR_MIDDLE: return "SAR_MIDDLE";
+	case RXM_OP_SAR_LAST:   return "SAR_LAST";
+	case RXM_OP_RNDV_CTRL:  return "RNDV_CTRL";
+	case RXM_OP_RNDV_RMA:   return "RNDV_RMA";
+	case RXM_OP_RMA:        return "RMA";
+	case RXM_OP_ATOMIC:     return "ATOMIC";
+	default:                return "UNKNOWN";
+	}
+}
+
 struct rxm_selector_ctx {
 	enum rxm_op_type op;
 	uint64_t msg_id;
