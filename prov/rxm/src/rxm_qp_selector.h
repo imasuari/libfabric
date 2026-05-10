@@ -1,6 +1,7 @@
 #ifndef RXM_QP_SELECTOR_H
 #define RXM_QP_SELECTOR_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -39,8 +40,17 @@ struct rxm_selector_ctx {
 	uint64_t msg_id;
 };
 
+struct rxm_selector_result {
+	uint8_t idx;
+	/* true when the op would benefit from running on a secondary slot;
+	 * rxm_conn_msg_ep uses it to drive demand-based lazy msg_ep growth.
+	 */
+	bool wants_spread;
+};
+
 struct rxm_qp_selector {
-	uint8_t (*select)(struct rxm_conn *conn,
+	struct rxm_selector_result
+		(*select)(struct rxm_conn *conn,
 			  const struct rxm_selector_ctx *ctx);
 	void (*destroy)(struct rxm_qp_selector *sel);
 };

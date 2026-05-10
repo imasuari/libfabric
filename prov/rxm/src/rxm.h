@@ -799,13 +799,14 @@ rxm_conn_msg_ep(struct rxm_conn *conn, enum rxm_op_type op,
 		.op = op,
 		.msg_id = msg_id,
 	};
-	uint8_t idx = conn->selector->select(conn, &ctx);
+	struct rxm_selector_result r = conn->selector->select(conn, &ctx);
 
-	assert(idx < conn->num_msg_eps);
+	assert(r.idx < conn->num_msg_eps);
 	FI_DBG(&rxm_prov, FI_LOG_EP_DATA,
-	       "qp_sel: conn=%p op=%s msg_id=0x%" PRIx64 " -> qp=%u/%u\n",
-	       conn, rxm_op_type_str(op), msg_id, idx, conn->num_msg_eps);
-	return conn->msg_eps[idx];
+	       "qp_sel: conn=%p op=%s msg_id=0x%" PRIx64 " -> qp=%u/%u spread=%d\n",
+	       conn, rxm_op_type_str(op), msg_id, r.idx, conn->num_msg_eps,
+	       r.wants_spread);
+	return conn->msg_eps[r.idx];
 }
 
 static inline ssize_t
