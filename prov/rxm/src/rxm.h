@@ -254,6 +254,24 @@ struct rxm_conn {
 	struct fid_ep **msg_eps;
 	struct rxm_ep_slot *slots;
 	uint8_t num_msg_eps;
+	/* Count of slots in [0, connected_msg_eps) that are CONNECTED.
+	 * The selector is restricted to this range so TX always lands on
+	 * a real, connected endpoint. Slot 0 moves it to 1 on primary
+	 * CONNECTED; lazy secondary connects bump it one at a time.
+	 */
+	uint8_t connected_msg_eps;
+	/* True iff slot `connected_msg_eps` is currently being brought up
+	 * (fi_connect issued, awaiting FI_CONNECTED or error). Gate for
+	 * the "never initiate the same slot twice" rule and serializes
+	 * growth to one in-flight slot at a time.
+	 */
+	bool lazy_connecting;
+	/* -1 if no failure; else the smallest slot index that failed.
+	 * Once set, the usable range is permanently capped at this
+	 * value for the lifetime of the conn — no retries of this slot
+	 * or any higher slot.
+	 */
+	int8_t failed_slot;
 	struct rxm_qp_selector *selector;
 	struct rxm_ep *ep;
 
@@ -810,6 +828,9 @@ static inline size_t rxm_ep_max_atomic_size(struct fi_info *info)
 	return rxm_buffer_size - sizeof(struct rxm_atomic_hdr);
 }
 
+void rxm_maybe_start_secondary_connect(struct rxm_conn *conn);
+
+
 static inline struct fid_ep *
 rxm_conn_msg_ep(struct rxm_conn *conn, enum rxm_op_type op,
 	       uint64_t msg_id)
@@ -820,11 +841,13 @@ rxm_conn_msg_ep(struct rxm_conn *conn, enum rxm_op_type op,
 	};
 	struct rxm_selector_result r = conn->selector->select(conn, &ctx);
 
-	assert(r.idx < conn->num_msg_eps);
+	assert(r.idx < conn->connected_msg_eps);
 	FI_DBG(&rxm_prov, FI_LOG_EP_DATA,
-	       "qp_sel: conn=%p op=%s msg_id=0x%" PRIx64 " -> qp=%u/%u spread=%d\n",
-	       conn, rxm_op_type_str(op), msg_id, r.idx, conn->num_msg_eps,
-	       r.wants_spread);
+	       "qp_sel: conn=%p op=%s msg_id=0x%" PRIx64 " -> qp=%u/%u/%u spread=%d\n",
+	       conn, rxm_op_type_str(op), msg_id, r.idx,
+	       conn->connected_msg_eps, conn->num_msg_eps, r.wants_spread);
+	if (r.wants_spread)
+		rxm_maybe_start_secondary_connect(conn);
 	return conn->msg_eps[r.idx];
 }
 

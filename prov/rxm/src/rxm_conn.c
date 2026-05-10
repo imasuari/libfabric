@@ -79,10 +79,17 @@ static void rxm_close_conn(struct rxm_conn *conn)
 		rx_entry = (struct fi_peer_rx_entry*)conn->deferred_sar_msgs.next;
 		rx_entry->srx->owner_ops->free_entry(rx_entry);
 	}
-	if (conn->msg_eps && conn->msg_eps[0]) {
-		fi_close(&conn->msg_eps[0]->fid);
-		for (uint8_t i = 0; i < conn->num_msg_eps; i++)
-			conn->msg_eps[i] = NULL;
+	conn->connected_msg_eps = 0;
+	conn->lazy_connecting = false;
+	conn->failed_slot = -1;
+
+	if (conn->msg_eps) {
+		for (uint8_t i = 0; i < conn->num_msg_eps; i++) {
+			if (conn->msg_eps[i]) {
+				fi_close(&conn->msg_eps[i]->fid);
+				conn->msg_eps[i] = NULL;
+			}
+		}
 	}
 	rxm_flush_msg_cq(conn->ep);
 	dlist_remove_init(&conn->loopback_entry);
@@ -170,80 +177,126 @@ static int rxm_bind_comp(struct rxm_ep *ep, struct fid_ep *msg_ep)
 	return 0;
 }
 
-static int rxm_open_conn(struct rxm_conn *conn, struct fi_info *msg_info)
+/* Allocate conn->msg_eps and conn->slots on the primary-open path.
+ * Slots 1..N-1 remain NULL until lazy-connected. Idempotent across
+ * close/reopen cycles: rxm_close_conn leaves the arrays allocated (to
+ * keep fid->context pointers valid for late EQ events) with every
+ * msg_eps[i] nulled; this function reuses them when it finds arrays
+ * already present.
+ */
+static int rxm_alloc_slot_arrays(struct rxm_conn *conn)
+{
+	if (conn->msg_eps && conn->slots) {
+		for (uint8_t i = 0; i < conn->num_msg_eps; i++) {
+			assert(!conn->msg_eps[i]);
+			conn->slots[i].conn = conn;
+			conn->slots[i].slot_idx = i;
+		}
+		return 0;
+	}
+	assert(!conn->msg_eps && !conn->slots);
+	conn->msg_eps = calloc(conn->num_msg_eps, sizeof(*conn->msg_eps));
+	conn->slots = calloc(conn->num_msg_eps, sizeof(*conn->slots));
+	if (!conn->msg_eps || !conn->slots) {
+		free(conn->msg_eps);
+		conn->msg_eps = NULL;
+		free(conn->slots);
+		conn->slots = NULL;
+		return -FI_ENOMEM;
+	}
+	for (uint8_t i = 0; i < conn->num_msg_eps; i++) {
+		conn->slots[i].conn = conn;
+		conn->slots[i].slot_idx = i;
+	}
+	return 0;
+}
+
+/* Open one msg_ep for a given slot and make it ready to connect/accept.
+ * Binds EQ/SRX/CQ/cntrs, enables, and preposts receives. The returned ep
+ * is NOT yet assigned to conn->msg_eps[slot_idx] — the caller owns that.
+ */
+static int rxm_open_slot(struct rxm_conn *conn, struct fi_info *msg_info,
+			 uint8_t slot_idx, struct fid_ep **out_ep)
 {
 	struct rxm_domain *domain;
 	struct rxm_ep *ep;
 	struct fid_ep *msg_ep;
 	int ret;
 
-	FI_DBG(&rxm_prov, FI_LOG_EP_CTRL, "open msg ep %p\n", conn);
+	FI_DBG(&rxm_prov, FI_LOG_EP_CTRL, "open msg ep %p slot %u\n", conn,
+	       slot_idx);
 
 	assert(ofi_genlock_held(&conn->ep->util_ep.lock));
+	assert(slot_idx < conn->num_msg_eps && conn->slots);
 	ep = conn->ep;
 	domain = container_of(ep->util_ep.domain, struct rxm_domain,
 			      util_domain);
 
-	conn->msg_eps = calloc(conn->num_msg_eps, sizeof(*conn->msg_eps));
-	conn->slots = calloc(conn->num_msg_eps, sizeof(*conn->slots));
-	if (!conn->msg_eps || !conn->slots) {
-		ret = -FI_ENOMEM;
-		goto err_free;
-	}
-	for (uint8_t i = 0; i < conn->num_msg_eps; i++) {
-		conn->slots[i].conn = conn;
-		conn->slots[i].slot_idx = i;
-	}
-
 	ret = fi_endpoint(domain->msg_domain, msg_info, &msg_ep,
-			  &conn->slots[0]);
+			  &conn->slots[slot_idx]);
 	if (ret) {
 		RXM_WARN_ERR(FI_LOG_EP_CTRL, "fi_endpoint", ret);
-		goto err_free;
+		return ret;
 	}
 
 	ret = fi_ep_bind(msg_ep, &ep->msg_eq->fid, 0);
 	if (ret) {
 		RXM_WARN_ERR(FI_LOG_EP_CTRL, "fi_ep_bind", ret);
-		goto err_close;
+		goto err;
 	}
 
 	if (ep->msg_srx) {
 		ret = fi_ep_bind(msg_ep, &ep->msg_srx->fid, 0);
 		if (ret) {
 			RXM_WARN_ERR(FI_LOG_EP_CTRL, "fi_ep_bind", ret);
-			goto err_close;
+			goto err;
 		}
 	}
 
 	ret = rxm_bind_comp(ep, msg_ep);
 	if (ret)
-		goto err_close;
+		goto err;
 
 	ret = fi_enable(msg_ep);
 	if (ret) {
 		RXM_WARN_ERR(FI_LOG_EP_CTRL, "fi_enable", ret);
-		goto err_close;
+		goto err;
 	}
 
-	conn->flow_ctrl = domain->flow_ctrl_ops->available(msg_ep);
+	/* Primary slot determines flow_ctrl availability for the conn;
+	 * secondaries inherit and are enabled in lockstep with primary. */
+	if (slot_idx == 0)
+		conn->flow_ctrl = domain->flow_ctrl_ops->available(msg_ep);
 
 	if (!ep->msg_srx) {
 		ret = rxm_prepost_recv(ep, msg_ep);
 		if (ret)
-			goto err_close;
+			goto err;
 	}
 
-	for (uint8_t i = 0; i < conn->num_msg_eps; i++)
-		conn->msg_eps[i] = msg_ep;
+	*out_ep = msg_ep;
 	return 0;
-err_close:
+err:
 	fi_close(&msg_ep->fid);
-err_free:
-	free(conn->msg_eps);
-	conn->msg_eps = NULL;
-	free(conn->slots);
-	conn->slots = NULL;
+	return ret;
+}
+
+/* Primary-open path: allocate slot arrays + open slot 0. On open failure
+ * leave the arrays allocated (rxm_free_conn will release them) and just
+ * ensure msg_eps[0] is NULL — the arrays are reusable across close/reopen
+ * cycles and may have been inherited from a prior open by the idempotent
+ * rxm_alloc_slot_arrays.
+ */
+static int rxm_open_primary(struct rxm_conn *conn, struct fi_info *msg_info)
+{
+	int ret;
+
+	ret = rxm_alloc_slot_arrays(conn);
+	if (ret)
+		return ret;
+	ret = rxm_open_slot(conn, msg_info, 0, &conn->msg_eps[0]);
+	if (ret)
+		conn->msg_eps[0] = NULL;
 	return ret;
 }
 
@@ -302,13 +355,18 @@ static int rxm_send_connect(struct rxm_conn *conn)
 	if (!info->dest_addr)
 		return -FI_ENOMEM;
 
-	ret = rxm_open_conn(conn, info);
+	ret = rxm_open_primary(conn, info);
 	if (ret)
 		return ret;
 
 	ret = rxm_init_connect_data(conn, &cm_data);
 	if (ret)
 		goto err;
+
+	/* slot_idx == 0: the primary connect that creates the rxm_conn on
+	 * the accepting side. Lazy secondaries set this field to their
+	 * slot index. */
+	cm_data.connect.slot_idx = 0;
 
 	ret = fi_connect(conn->msg_eps[0], info->dest_addr, &cm_data,
 			 sizeof(cm_data));
@@ -321,13 +379,110 @@ static int rxm_send_connect(struct rxm_conn *conn)
 	return 0;
 
 err:
-	if (conn->msg_eps && conn->msg_eps[0])
+	/* Leave the slot arrays allocated; rxm_free_conn is the single owner
+	 * of that memory and a late EQ event for the just-closed ep still
+	 * dereferences fid->context into conn->slots[]. */
+	if (conn->msg_eps && conn->msg_eps[0]) {
 		fi_close(&conn->msg_eps[0]->fid);
-	free(conn->msg_eps);
-	conn->msg_eps = NULL;
-	free(conn->slots);
-	conn->slots = NULL;
+		conn->msg_eps[0] = NULL;
+	}
 	return ret;
+}
+
+/* Bring up msg_eps[slot_idx] as a secondary slot on an already-CONNECTED
+ * rxm_conn. Mirrors rxm_send_connect but:
+ *   - does not touch conn->state (primary stays CONNECTED);
+ *   - does not bump ep->connecting_cnt (per-slot progress is tracked
+ *     by conn->lazy_connecting alone);
+ *   - on any failure, sets conn->failed_slot = slot_idx without tearing
+ *     down the primary.
+ * Preconditions checked by the caller: state==CONNECTED,
+ * slot_idx==connected_msg_eps, !lazy_connecting, slot_idx<num_msg_eps,
+ * and (failed_slot<0 || slot_idx<failed_slot).
+ */
+static int rxm_send_secondary_connect(struct rxm_conn *conn, uint8_t slot_idx)
+{
+	union rxm_cm_data cm_data;
+	struct fid_ep *new_ep = NULL;
+	struct fi_info *info;
+	int ret;
+
+	assert(ofi_genlock_held(&conn->ep->util_ep.lock));
+	assert(conn->state == RXM_CM_CONNECTED);
+	assert(!conn->lazy_connecting);
+	assert(slot_idx == conn->connected_msg_eps);
+	assert(slot_idx < conn->num_msg_eps);
+	assert(conn->failed_slot < 0 || slot_idx < (uint8_t) conn->failed_slot);
+
+	FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
+		"lazy secondary connect %p slot %u\n", conn, slot_idx);
+
+	info = conn->ep->msg_info;
+	info->dest_addrlen = conn->ep->msg_info->src_addrlen;
+	free(info->dest_addr);
+	info->dest_addr = mem_dup(&conn->peer->addr, info->dest_addrlen);
+	if (!info->dest_addr) {
+		conn->failed_slot = (int8_t) slot_idx;
+		return -FI_ENOMEM;
+	}
+
+	ret = rxm_open_slot(conn, info, slot_idx, &new_ep);
+	if (ret)
+		goto fail;
+
+	ret = rxm_init_connect_data(conn, &cm_data);
+	if (ret)
+		goto fail_close;
+
+	cm_data.connect.slot_idx = slot_idx;
+
+	ret = fi_connect(new_ep, info->dest_addr, &cm_data, sizeof(cm_data));
+	if (ret) {
+		RXM_WARN_ERR(FI_LOG_EP_CTRL, "fi_connect", ret);
+		goto fail_close;
+	}
+
+	conn->msg_eps[slot_idx] = new_ep;
+	conn->lazy_connecting = true;
+	return 0;
+
+fail_close:
+	fi_close(&new_ep->fid);
+fail:
+	conn->failed_slot = (int8_t) slot_idx;
+	return ret;
+}
+
+void rxm_maybe_start_secondary_connect(struct rxm_conn *conn)
+{
+	uint8_t next;
+
+	assert(ofi_genlock_held(&conn->ep->util_ep.lock));
+
+	/* Fast negative paths first — this runs on the TX hot path. */
+	if (conn->state != RXM_CM_CONNECTED)
+		return;
+	if (conn->lazy_connecting)
+		return;
+	if (conn->connected_msg_eps >= conn->num_msg_eps)
+		return;
+	if (conn->failed_slot >= 0 &&
+	    conn->connected_msg_eps >= (uint8_t) conn->failed_slot)
+		return;
+	/* Either side may initiate a secondary connect. Simultaneous-initiate
+	 * races are tie-broken by address at accept time in
+	 * rxm_process_secondary_connreq, mirroring the primary
+	 * simultaneous-connect handling in rxm_process_connreq. The one case
+	 * excluded here is loopback/self (addr cmp == 0): the loopback conn
+	 * lives on ep->loopback_list rather than in conn_idx_map, so a
+	 * secondary connreq would be mis-routed.
+	 */
+	if (ofi_addr_cmp(&rxm_prov, &conn->peer->addr.sa,
+			 &conn->ep->addr.sa) == 0)
+		return;
+
+	next = conn->connected_msg_eps;
+	(void) rxm_send_secondary_connect(conn, next);
 }
 
 static int rxm_connect(struct rxm_conn *conn)
@@ -440,6 +595,9 @@ rxm_alloc_conn(struct rxm_ep *ep, struct util_peer_addr *peer)
 	conn->flags = 0;
 	conn->flow_ctrl = false;
 	conn->peer_flow_ctrl = false;
+	conn->connected_msg_eps = 0;
+	conn->lazy_connecting = false;
+	conn->failed_slot = -1;
 	dlist_init(&conn->deferred_entry);
 	dlist_init(&conn->deferred_tx_queue);
 	dlist_init(&conn->deferred_sar_msgs);
@@ -459,6 +617,7 @@ rxm_alloc_conn(struct rxm_ep *ep, struct util_peer_addr *peer)
 		conn->num_msg_eps = 1;
 	}
 	conn->msg_eps = NULL;
+	conn->slots = NULL;
 
 	if (conn->num_msg_eps > 1) {
 		conn->selector = rxm_rr_selector_alloc();
@@ -562,15 +721,38 @@ static void rxm_set_peer_flow_ctrl(struct rxm_conn *conn, int cm_flow_ctrl_flag)
 void rxm_process_connect(struct rxm_eq_cm_entry *cm_entry)
 {
 	struct rxm_ep_slot *slot = cm_entry->fid->context;
-	struct rxm_conn *conn;
+	struct rxm_conn *conn = slot->conn;
+	uint8_t slot_idx = slot->slot_idx;
 	struct rxm_domain *domain;
 
-	conn = slot->conn;
 	FI_DBG(&rxm_prov, FI_LOG_EP_CTRL,
-	       "processing connected for handle: %p slot %u\n", conn,
-	       slot->slot_idx);
+	       "processing connected for handle: %p slot %u\n", conn, slot_idx);
 
 	assert(ofi_genlock_held(&conn->ep->util_ep.lock));
+
+	if (slot_idx > 0) {
+		/* Secondary slot came up. Primary stays CONNECTED; we just
+		 * widen the selector's usable range by one. Growth to slot
+		 * k+1 is not auto-chained: the next TX that observes a
+		 * wants_spread op and sees connected < num will re-trigger
+		 * rxm_maybe_start_secondary_connect.
+		 */
+		assert(conn->state == RXM_CM_CONNECTED);
+		assert(conn->lazy_connecting);
+		assert(slot_idx == conn->connected_msg_eps);
+		if (conn->flow_ctrl && conn->peer_flow_ctrl) {
+			domain = container_of(conn->ep->util_ep.domain,
+					      struct rxm_domain, util_domain);
+			domain->flow_ctrl_ops->enable(
+				conn->msg_eps[slot_idx],
+				conn->ep->msg_info->rx_attr->size / 2);
+		}
+		conn->connected_msg_eps = slot_idx + 1;
+		conn->lazy_connecting = false;
+		return;
+	}
+
+	/* Primary (slot 0) connect. */
 	if (conn->state == RXM_CM_CONNECTING) {
 		conn->remote_index = rxm_peer_index(cm_entry->data.accept.
 						    server_conn_id);
@@ -589,19 +771,45 @@ void rxm_process_connect(struct rxm_eq_cm_entry *cm_entry)
 	conn->ep->connecting_cnt--;
 	assert(conn->ep->connecting_cnt >= 0);
 	conn->state = RXM_CM_CONNECTED;
+	conn->connected_msg_eps = 1;
+}
+
+/* Tear down a secondary slot that failed. Closes the slot's msg_ep,
+ * caps connected_msg_eps at failed_slot, clears lazy_connecting. The
+ * primary slot (and the rxm_conn as a whole) stays alive.
+ */
+static void
+rxm_fail_secondary_slot(struct rxm_conn *conn, uint8_t slot_idx)
+{
+	assert(slot_idx > 0);
+	assert(ofi_genlock_held(&conn->ep->util_ep.lock));
+
+	FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
+		"secondary slot %u failed on conn %p\n", slot_idx, conn);
+
+	if (conn->msg_eps && conn->msg_eps[slot_idx]) {
+		fi_close(&conn->msg_eps[slot_idx]->fid);
+		conn->msg_eps[slot_idx] = NULL;
+	}
+	if (conn->failed_slot < 0 || slot_idx < (uint8_t) conn->failed_slot)
+		conn->failed_slot = (int8_t) slot_idx;
+	if (conn->connected_msg_eps > slot_idx)
+		conn->connected_msg_eps = slot_idx;
+	conn->lazy_connecting = false;
 }
 
 /* For simultaneous connection requests, if the peer won the coin
  * flip (reject EALREADY), our connection request is discarded.
  */
 static void
-rxm_process_reject(struct rxm_conn *conn, struct fi_eq_err_entry *entry)
+rxm_process_reject(struct rxm_conn *conn, uint8_t slot_idx,
+		   struct fi_eq_err_entry *entry)
 {
 	union rxm_cm_data *cm_data;
 	uint8_t reason;
 
 	FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
-	       "Processing reject for handle: %p\n", conn);
+	       "Processing reject for handle: %p slot %u\n", conn, slot_idx);
 	assert(ofi_genlock_held(&conn->ep->util_ep.lock));
 
 	if (entry->err_data_size >= sizeof(cm_data->reject)) {
@@ -614,6 +822,26 @@ rxm_process_reject(struct rxm_conn *conn, struct fi_eq_err_entry *entry)
 		}
 	} else {
 		reason = RXM_REJECT_ECONNREFUSED;
+	}
+
+	if (slot_idx > 0) {
+		/* Secondary reject. EALREADY means the peer's connreq for
+		 * this slot won and will fill the slot shortly — drop our
+		 * pending ep but don't mark the slot dead. Any other reason
+		 * retires the slot permanently. */
+		if (conn->msg_eps && conn->msg_eps[slot_idx]) {
+			fi_close(&conn->msg_eps[slot_idx]->fid);
+			conn->msg_eps[slot_idx] = NULL;
+		}
+		if (reason == RXM_REJECT_EALREADY) {
+			conn->lazy_connecting = false;
+		} else {
+			if (conn->failed_slot < 0 ||
+			    slot_idx < (uint8_t) conn->failed_slot)
+				conn->failed_slot = (int8_t) slot_idx;
+			conn->lazy_connecting = false;
+		}
+		return;
 	}
 
 	switch (conn->state) {
@@ -687,7 +915,8 @@ rxm_reject_connreq(struct rxm_ep *ep, struct rxm_eq_cm_entry *cm_entry,
 }
 
 static int
-rxm_accept_connreq(struct rxm_conn *conn, struct rxm_eq_cm_entry *cm_entry)
+rxm_accept_connreq(struct rxm_conn *conn, struct rxm_eq_cm_entry *cm_entry,
+		   uint8_t slot_idx)
 {
 	union rxm_cm_data cm_data;
 	int ret;
@@ -700,10 +929,98 @@ rxm_accept_connreq(struct rxm_conn *conn, struct rxm_eq_cm_entry *cm_entry)
 	cm_data.accept.align_pad[1] = 0;
 	cm_data.accept.align_pad[2] = 0;
 
-	ret = fi_accept(conn->msg_eps[0], &cm_data.accept, sizeof(cm_data.accept));
+	ret = fi_accept(conn->msg_eps[slot_idx], &cm_data.accept,
+			sizeof(cm_data.accept));
 	if (ret)
 		RXM_WARN_ERR(FI_LOG_EP_CTRL, "fi_accept", ret);
 	return ret;
+}
+
+/* Handle an FI_CONNREQ with slot_idx > 0 (lazy secondary). Looks up the
+ * existing rxm_conn to the same peer; a secondary for a nonexistent or
+ * not-yet-CONNECTED conn is a protocol violation or race and gets
+ * rejected. On success, opens msg_eps[slot_idx], accepts, and leaves
+ * the primary state untouched.
+ */
+static void
+rxm_process_secondary_connreq(struct rxm_ep *ep,
+			      struct rxm_eq_cm_entry *cm_entry,
+			      struct util_peer_addr *peer,
+			      uint8_t slot_idx)
+{
+	struct rxm_conn *conn;
+	struct fid_ep *new_ep = NULL;
+	uint8_t reject_reason = RXM_REJECT_ECONNREFUSED;
+	int ret;
+
+	assert(slot_idx > 0);
+	conn = ofi_idm_lookup(&ep->conn_idx_map, peer->index);
+	if (!conn)
+		goto reject;
+
+	if (conn->state != RXM_CM_CONNECTED) {
+		/* Peer initiated a secondary before we observed primary
+		 * CONNECTED. EALREADY tells them to back off; their next
+		 * TX will retry once both sides see primary up. */
+		reject_reason = RXM_REJECT_EALREADY;
+		goto reject;
+	}
+	if (slot_idx != conn->connected_msg_eps)
+		goto reject;
+	if (conn->failed_slot >= 0 && slot_idx >= (uint8_t) conn->failed_slot)
+		goto reject;
+	if (conn->lazy_connecting) {
+		/* Both sides raced a secondary connect on slot k. Deterministic
+		 * tie-break on address: the higher-address side keeps its
+		 * in-flight connect and rejects the peer's with EALREADY; the
+		 * lower-address side tears down its in-flight msg_ep and
+		 * accepts the peer's. Mirrors the primary tie-break in
+		 * rxm_process_connreq.
+		 *
+		 * cmp = ofi_addr_cmp(peer, ep); cmp < 0 means peer < ep i.e.
+		 * we are higher-addr → reject. cmp == 0 is unreachable here —
+		 * rxm_maybe_start_secondary_connect suppresses loopback, and
+		 * the only other caller path is a remote peer.
+		 *
+		 * EALREADY (not ECONNREFUSED) is load-bearing: it clears the
+		 * peer's lazy_connecting without marking failed_slot, so the
+		 * peer can re-observe our connreq via the normal accept path.
+		 */
+		int cmp = ofi_addr_cmp(&rxm_prov, &peer->addr.sa,
+				       &ep->addr.sa);
+		if (cmp <= 0) {
+			reject_reason = RXM_REJECT_EALREADY;
+			goto reject;
+		}
+		if (conn->msg_eps[slot_idx])
+			fi_close(&conn->msg_eps[slot_idx]->fid);
+		conn->msg_eps[slot_idx] = NULL;
+		conn->lazy_connecting = false;
+	}
+
+	ret = rxm_open_slot(conn, cm_entry->info, slot_idx, &new_ep);
+	if (ret) {
+		conn->failed_slot = (int8_t) slot_idx;
+		goto reject;
+	}
+	conn->msg_eps[slot_idx] = new_ep;
+
+	ret = rxm_accept_connreq(conn, cm_entry, slot_idx);
+	if (ret) {
+		fi_close(&new_ep->fid);
+		conn->msg_eps[slot_idx] = NULL;
+		conn->failed_slot = (int8_t) slot_idx;
+		goto reject;
+	}
+	conn->lazy_connecting = true;
+	util_put_peer(peer);
+	fi_freeinfo(cm_entry->info);
+	return;
+
+reject:
+	util_put_peer(peer);
+	rxm_reject_connreq(ep, cm_entry, reject_reason);
+	fi_freeinfo(cm_entry->info);
 }
 
 static void
@@ -713,6 +1030,7 @@ rxm_process_connreq(struct rxm_ep *ep, struct rxm_eq_cm_entry *cm_entry)
 	struct util_peer_addr *peer;
 	struct rxm_conn *conn;
 	struct rxm_av *av;
+	uint8_t slot_idx;
 	ssize_t ret;
 	int cmp;
 
@@ -729,6 +1047,12 @@ rxm_process_connreq(struct rxm_ep *ep, struct rxm_eq_cm_entry *cm_entry)
 	if (!peer) {
 		RXM_WARN_ERR(FI_LOG_EP_CTRL, "util_get_peer", -FI_ENOMEM);
 		goto reject;
+	}
+
+	slot_idx = cm_entry->data.connect.slot_idx;
+	if (slot_idx > 0) {
+		rxm_process_secondary_connreq(ep, cm_entry, peer, slot_idx);
+		return;
 	}
 
 	conn = rxm_add_conn(ep, peer);
@@ -789,13 +1113,13 @@ rxm_process_connreq(struct rxm_ep *ep, struct rxm_eq_cm_entry *cm_entry)
 
 	conn->remote_pid = rxm_peer_pid(cm_entry->data.connect.client_conn_id);
 	conn->remote_index = rxm_peer_index(cm_entry->data.connect.client_conn_id);
-	ret = rxm_open_conn(conn, cm_entry->info);
+	ret = rxm_open_primary(conn, cm_entry->info);
 	if (ret)
 		goto free;
 
 	rxm_set_peer_flow_ctrl(conn, cm_entry->data.connect.flow_ctrl);
 
-	ret = rxm_accept_connreq(conn, cm_entry);
+	ret = rxm_accept_connreq(conn, cm_entry, 0);
 	if (ret)
 		goto close;
 
@@ -817,12 +1141,18 @@ reject:
 	fi_freeinfo(cm_entry->info);
 }
 
-void rxm_process_shutdown(struct rxm_conn *conn)
+static void rxm_process_shutdown_slot(struct rxm_conn *conn, uint8_t slot_idx)
 {
 	assert(ofi_genlock_held(&conn->ep->util_ep.lock));
 
-	FI_INFO(&rxm_prov, FI_LOG_EP_CTRL, "shutdown conn %p (state %d)\n",
-		conn, conn->state);
+	FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
+		"shutdown conn %p slot %u (state %d)\n", conn, slot_idx,
+		conn->state);
+
+	if (slot_idx > 0) {
+		rxm_fail_secondary_slot(conn, slot_idx);
+		return;
+	}
 
 	switch (conn->state) {
 	case RXM_CM_IDLE:
@@ -872,9 +1202,11 @@ static void rxm_handle_error(struct rxm_ep *ep)
 
 	struct rxm_ep_slot *slot = entry.fid->context;
 	if (entry.err == ECONNREFUSED) {
-		rxm_process_reject(slot->conn, &entry);
+		rxm_process_reject(slot->conn, slot->slot_idx, &entry);
+	} else if (slot->slot_idx > 0) {
+		rxm_fail_secondary_slot(slot->conn, slot->slot_idx);
 	} else {
-		rxm_process_shutdown(slot->conn);
+		rxm_process_shutdown_slot(slot->conn, 0);
 	}
 }
 
@@ -894,7 +1226,7 @@ rxm_handle_event(struct rxm_ep *ep, uint32_t event,
 		break;
 	case FI_SHUTDOWN: {
 		struct rxm_ep_slot *slot = cm_entry->fid->context;
-		rxm_process_shutdown(slot->conn);
+		rxm_process_shutdown_slot(slot->conn, slot->slot_idx);
 		break;
 	}
 	default:

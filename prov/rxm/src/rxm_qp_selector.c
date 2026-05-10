@@ -19,9 +19,20 @@ const struct rxm_qp_selector rxm_selector_single_qp = {
 
 static uint8_t rxm_rr_next(struct rxm_rr_selector *rr, struct rxm_conn *conn)
 {
-	if (conn->num_msg_eps <= 1)
+	/* Range over currently-connected slots only; the fraction
+	 * [1, connected) skips slot 0 so spread ops land on secondaries
+	 * when at least one is up, and collapse to 0 otherwise. */
+	if (conn->connected_msg_eps <= 1)
 		return 0;
-	return 1 + (rr->rr_counter++ % (conn->num_msg_eps - 1));
+	return 1 + (rr->rr_counter++ % (conn->connected_msg_eps - 1));
+}
+
+static uint8_t rxm_clamp_slot(struct rxm_conn *conn, uint8_t idx)
+{
+	/* A SAR pin may name a slot that is no longer usable (failed_slot
+	 * moved the cap below it). Demote to 0 so the remaining segments
+	 * stay in-order on the primary. */
+	return idx < conn->connected_msg_eps ? idx : 0;
 }
 
 static struct rxm_selector_result
@@ -42,7 +53,8 @@ rxm_rr_select(struct rxm_conn *conn, const struct rxm_selector_ctx *ctx)
 		slot = ofi_idm_lookup(&rr->sar_pins, (int) ctx->msg_id);
 		if (slot)
 			return (struct rxm_selector_result){
-				.idx = (uint8_t)((uintptr_t) slot - 1),
+				.idx = rxm_clamp_slot(conn,
+					(uint8_t)((uintptr_t) slot - 1)),
 				.wants_spread = true };
 		idx = rxm_rr_next(rr, conn);
 		/* On map-grow OOM, fall back to qp 0 for the rest of this
@@ -60,7 +72,8 @@ rxm_rr_select(struct rxm_conn *conn, const struct rxm_selector_ctx *ctx)
 		if (slot) {
 			ofi_idm_clear(&rr->sar_pins, (int) ctx->msg_id);
 			return (struct rxm_selector_result){
-				.idx = (uint8_t)((uintptr_t) slot - 1),
+				.idx = rxm_clamp_slot(conn,
+					(uint8_t)((uintptr_t) slot - 1)),
 				.wants_spread = true };
 		}
 		return (struct rxm_selector_result){
