@@ -87,7 +87,13 @@ union rxm_cm_data {
 		uint8_t op_version;
 		uint16_t port;
 		uint8_t flow_ctrl;
-		uint8_t padding;
+		/* Index of the msg_ep slot this connect is for; 0 is the
+		 * primary (creates the rxm_conn), >0 is a lazy secondary
+		 * that attaches to an already-CONNECTED rxm_conn. Pre-
+		 * multi-QP peers memset this byte to 0 via
+		 * rxm_init_connect_data, so old senders are interpreted
+		 * as primary and the wire format is unchanged. */
+		uint8_t slot_idx;
 		uint32_t eager_limit;
 		uint32_t rx_size; /* used? */
 		uint64_t client_conn_id;
@@ -226,6 +232,18 @@ enum {
 	RXM_CONN_INDEXED = BIT(0),
 };
 
+struct rxm_conn;
+
+/* Per-slot msg_ep context. A pointer to one of these is passed as the
+ * `context` arg to fi_endpoint for each slot, so CM events, credit
+ * callbacks, and rx_buf hand-offs can recover both the owning rxm_conn
+ * and the slot index from fid->context.
+ */
+struct rxm_ep_slot {
+	struct rxm_conn *conn;
+	uint8_t slot_idx;
+};
+
 /* Each local rxm ep will have at most 1 connection to a single
  * remote rxm ep.  A local rxm ep may not be connected to all
  * remote rxm ep's.
@@ -234,6 +252,7 @@ struct rxm_conn {
 	enum rxm_cm_state state;
 	struct util_peer_addr *peer;
 	struct fid_ep **msg_eps;
+	struct rxm_ep_slot *slots;
 	uint8_t num_msg_eps;
 	struct rxm_qp_selector *selector;
 	struct rxm_ep *ep;

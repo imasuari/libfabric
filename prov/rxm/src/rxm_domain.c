@@ -777,7 +777,8 @@ static struct fi_ops_mr rxm_domain_mr_thru_ops = {
 
 static ssize_t rxm_send_credits(struct fid_ep *ep, uint64_t credits)
 {
-	struct rxm_conn *rxm_conn = ep->fid.context;
+	struct rxm_ep_slot *slot = ep->fid.context;
+	struct rxm_conn *rxm_conn = slot->conn;
 	struct rxm_ep *rxm_ep = rxm_conn->ep;
 	struct rxm_deferred_tx_entry *def_tx_entry;
 	struct rxm_tx_buf *tx_buf;

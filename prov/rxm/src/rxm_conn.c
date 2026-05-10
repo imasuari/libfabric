@@ -79,12 +79,13 @@ static void rxm_close_conn(struct rxm_conn *conn)
 		rx_entry = (struct fi_peer_rx_entry*)conn->deferred_sar_msgs.next;
 		rx_entry->srx->owner_ops->free_entry(rx_entry);
 	}
-	if (conn->msg_eps && conn->msg_eps[0])
+	if (conn->msg_eps && conn->msg_eps[0]) {
 		fi_close(&conn->msg_eps[0]->fid);
+		for (uint8_t i = 0; i < conn->num_msg_eps; i++)
+			conn->msg_eps[i] = NULL;
+	}
 	rxm_flush_msg_cq(conn->ep);
 	dlist_remove_init(&conn->loopback_entry);
-	free(conn->msg_eps);
-	conn->msg_eps = NULL;
 
 	if (conn->state == RXM_CM_CONNECTING || conn->state == RXM_CM_ACCEPTING)
 		conn->ep->connecting_cnt--;
@@ -182,34 +183,47 @@ static int rxm_open_conn(struct rxm_conn *conn, struct fi_info *msg_info)
 	ep = conn->ep;
 	domain = container_of(ep->util_ep.domain, struct rxm_domain,
 			      util_domain);
-	ret = fi_endpoint(domain->msg_domain, msg_info, &msg_ep, conn);
+
+	conn->msg_eps = calloc(conn->num_msg_eps, sizeof(*conn->msg_eps));
+	conn->slots = calloc(conn->num_msg_eps, sizeof(*conn->slots));
+	if (!conn->msg_eps || !conn->slots) {
+		ret = -FI_ENOMEM;
+		goto err_free;
+	}
+	for (uint8_t i = 0; i < conn->num_msg_eps; i++) {
+		conn->slots[i].conn = conn;
+		conn->slots[i].slot_idx = i;
+	}
+
+	ret = fi_endpoint(domain->msg_domain, msg_info, &msg_ep,
+			  &conn->slots[0]);
 	if (ret) {
 		RXM_WARN_ERR(FI_LOG_EP_CTRL, "fi_endpoint", ret);
-		return ret;
+		goto err_free;
 	}
 
 	ret = fi_ep_bind(msg_ep, &ep->msg_eq->fid, 0);
 	if (ret) {
 		RXM_WARN_ERR(FI_LOG_EP_CTRL, "fi_ep_bind", ret);
-		goto err;
+		goto err_close;
 	}
 
 	if (ep->msg_srx) {
 		ret = fi_ep_bind(msg_ep, &ep->msg_srx->fid, 0);
 		if (ret) {
 			RXM_WARN_ERR(FI_LOG_EP_CTRL, "fi_ep_bind", ret);
-			goto err;
+			goto err_close;
 		}
 	}
 
 	ret = rxm_bind_comp(ep, msg_ep);
 	if (ret)
-		goto err;
+		goto err_close;
 
 	ret = fi_enable(msg_ep);
 	if (ret) {
 		RXM_WARN_ERR(FI_LOG_EP_CTRL, "fi_enable", ret);
-		goto err;
+		goto err_close;
 	}
 
 	conn->flow_ctrl = domain->flow_ctrl_ops->available(msg_ep);
@@ -217,19 +231,19 @@ static int rxm_open_conn(struct rxm_conn *conn, struct fi_info *msg_info)
 	if (!ep->msg_srx) {
 		ret = rxm_prepost_recv(ep, msg_ep);
 		if (ret)
-			goto err;
+			goto err_close;
 	}
 
-	conn->msg_eps = calloc(conn->num_msg_eps, sizeof(*conn->msg_eps));
-	if (!conn->msg_eps) {
-		ret = -FI_ENOMEM;
-		goto err;
-	}
 	for (uint8_t i = 0; i < conn->num_msg_eps; i++)
 		conn->msg_eps[i] = msg_ep;
 	return 0;
-err:
+err_close:
 	fi_close(&msg_ep->fid);
+err_free:
+	free(conn->msg_eps);
+	conn->msg_eps = NULL;
+	free(conn->slots);
+	conn->slots = NULL;
 	return ret;
 }
 
@@ -311,6 +325,8 @@ err:
 		fi_close(&conn->msg_eps[0]->fid);
 	free(conn->msg_eps);
 	conn->msg_eps = NULL;
+	free(conn->slots);
+	conn->slots = NULL;
 	return ret;
 }
 
@@ -353,6 +369,15 @@ static void rxm_free_conn(struct rxm_conn *conn)
 	if (conn->selector && conn->selector->destroy)
 		conn->selector->destroy(conn->selector);
 	conn->selector = NULL;
+
+	/* Final release of the slot arrays. rxm_close_conn deliberately leaves
+	 * these alive so that late EQ events whose fid->context points into
+	 * conn->slots[] remain safe; this is the only site that frees them.
+	 */
+	free(conn->msg_eps);
+	conn->msg_eps = NULL;
+	free(conn->slots);
+	conn->slots = NULL;
 
 	util_put_peer(conn->peer);
 	av = container_of(conn->ep->util_ep.av, struct rxm_av, util_av);
@@ -536,12 +561,14 @@ static void rxm_set_peer_flow_ctrl(struct rxm_conn *conn, int cm_flow_ctrl_flag)
 
 void rxm_process_connect(struct rxm_eq_cm_entry *cm_entry)
 {
+	struct rxm_ep_slot *slot = cm_entry->fid->context;
 	struct rxm_conn *conn;
 	struct rxm_domain *domain;
 
-	conn = cm_entry->fid->context;
+	conn = slot->conn;
 	FI_DBG(&rxm_prov, FI_LOG_EP_CTRL,
-	       "processing connected for handle: %p\n", conn);
+	       "processing connected for handle: %p slot %u\n", conn,
+	       slot->slot_idx);
 
 	assert(ofi_genlock_held(&conn->ep->util_ep.lock));
 	if (conn->state == RXM_CM_CONNECTING) {
@@ -843,10 +870,11 @@ static void rxm_handle_error(struct rxm_ep *ep)
 	if (!entry.fid || entry.fid->fclass != FI_CLASS_EP)
 		return;
 
+	struct rxm_ep_slot *slot = entry.fid->context;
 	if (entry.err == ECONNREFUSED) {
-		rxm_process_reject(entry.fid->context, &entry);
+		rxm_process_reject(slot->conn, &entry);
 	} else {
-		rxm_process_shutdown(entry.fid->context);
+		rxm_process_shutdown(slot->conn);
 	}
 }
 
@@ -864,9 +892,11 @@ rxm_handle_event(struct rxm_ep *ep, uint32_t event,
 	case FI_CONNECTED:
 		rxm_process_connect(cm_entry);
 		break;
-	case FI_SHUTDOWN:
-		rxm_process_shutdown(cm_entry->fid->context);
+	case FI_SHUTDOWN: {
+		struct rxm_ep_slot *slot = cm_entry->fid->context;
+		rxm_process_shutdown(slot->conn);
 		break;
+	}
 	default:
 		FI_WARN(&rxm_prov, FI_LOG_EP_CTRL,
 			"Unknown event: %u\n", event);
