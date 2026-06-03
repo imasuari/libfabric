@@ -30,6 +30,14 @@ static uint8_t rxm_rr_next(struct rxm_rr_selector *rr, struct rxm_conn *conn)
 		return idx;
 	}
 
+	/* Ep not ready: kick a lazy open if it has never been opened, then
+	 * fall back to ep 0. rr_counter is NOT advanced — the next call
+	 * retries the same ep, giving the lazy open a natural chance to
+	 * land before rr moves on. A failed lazy open clamps num_msg_eps,
+	 * which the next call's modulo handles automatically. */
+	if (conn->states[idx] == RXM_CM_IDLE)
+		(void) rxm_lazy_connect(conn, idx);
+
 	return 0;
 }
 
