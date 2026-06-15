@@ -933,10 +933,17 @@ vrb_eq_cm_process_event(struct vrb_eq *eq,
 	struct vrb_xrc_ep *xrc_ep;
 
 	assert(ofi_mutex_held(&eq->event_lock));
-	if (getenv("RXM_DBG"))
-		fprintf(stderr, "[VRB_DBG pid=%d] cm_event id=%p ctx=%p event=%d (ADDR_RES=0 ROUTE_RES=2 ESTAB=9 CONNECT_REQ=4 CONNECT_RESP=5 REJECT=8 DISC=10 TIMEWAIT=14 ADDR_ERR=1 ROUTE_ERR=3 CONN_ERR=7 UNREACH=6) status=%d\n",
+	if (getenv("RXM_DBG")) {
+		const struct sockaddr_in *src = (const struct sockaddr_in *)
+			&cma_event->id->route.addr.src_addr;
+		const struct sockaddr_in *dst = (const struct sockaddr_in *)
+			&cma_event->id->route.addr.dst_addr;
+		fprintf(stderr, "[VRB_DBG pid=%d] cm_event id=%p ctx=%p event=%d status=%d src=0x%08x:%u dst=0x%08x:%u\n",
 			(int) getpid(), (void*)cma_event->id, (void*)fid,
-			cma_event->event, cma_event->status);
+			cma_event->event, cma_event->status,
+			ntohl(src->sin_addr.s_addr), ntohs(src->sin_port),
+			ntohl(dst->sin_addr.s_addr), ntohs(dst->sin_port));
+	}
 	switch (cma_event->event) {
 	case RDMA_CM_EVENT_ADDR_RESOLVED:
 		ep = container_of(fid, struct vrb_ep, util_ep.ep_fid);
