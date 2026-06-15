@@ -1,7 +1,16 @@
 #include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/types.h>
 
 #include "rxm.h"
 #include "rxm_ep_selector.h"
+
+#define RXM_DBG(fmt, ...) do { \
+	if (getenv("RXM_DBG")) \
+		fprintf(stderr, "[RXM_DBG pid=%d] " fmt "\n", \
+			(int) getpid(), ##__VA_ARGS__); \
+} while (0)
 
 static uint8_t rxm_single_ep_select(struct rxm_conn *conn,
 				    const struct rxm_pkt *pkt)
@@ -27,6 +36,8 @@ static uint8_t rxm_rr_next(struct rxm_rr_selector *rr, struct rxm_conn *conn)
 
 	if (conn->states[idx] == RXM_CM_CONNECTED) {
 		rr->rr_counter++;
+		RXM_DBG("rr_next PICK conn=%p idx=%u (state=CONNECTED) counter=%u",
+			(void*)conn, idx, rr->rr_counter);
 		return idx;
 	}
 
@@ -35,8 +46,13 @@ static uint8_t rxm_rr_next(struct rxm_rr_selector *rr, struct rxm_conn *conn)
 	 * retries the same ep, giving the lazy open a natural chance to
 	 * land before rr moves on. A failed lazy open clamps num_msg_eps,
 	 * which the next call's modulo handles automatically. */
-	if (conn->states[idx] == RXM_CM_IDLE)
+	if (conn->states[idx] == RXM_CM_IDLE) {
+		RXM_DBG("rr_next FIRE_LAZY conn=%p idx=%u state=IDLE", (void*)conn, idx);
 		(void) rxm_lazy_connect(conn, idx);
+	} else {
+		RXM_DBG("rr_next FALLBACK conn=%p idx=%u state=%d (not CONNECTED, not IDLE)",
+			(void*)conn, idx, conn->states[idx]);
+	}
 
 	return 0;
 }
