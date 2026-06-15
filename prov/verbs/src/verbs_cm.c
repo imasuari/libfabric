@@ -271,6 +271,9 @@ vrb_msg_ep_accept(struct fid_ep *ep, const void *param, size_t paramlen)
 	vrb_prof_func_start("rdma_accept");
 	ret = rdma_accept(_ep->id, &conn_param);
 	vrb_prof_func_end("rdma_accept");
+	if (getenv("RXM_DBG"))
+		fprintf(stderr, "[VRB_DBG pid=%d] rdma_accept ep=%p id=%p ret=%d errno=%d\n",
+			(int) getpid(), (void*)_ep, (void*)_ep->id, ret, errno);
 	if (ret) {
 		VRB_WARN_ERRNO(FI_LOG_EP_CTRL, "rdma_accept");
 		_ep->state = VRB_DISCONNECTED;

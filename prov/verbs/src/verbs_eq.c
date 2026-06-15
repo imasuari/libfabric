@@ -869,7 +869,12 @@ vrb_eq_addr_resolved_event(struct vrb_ep *ep)
 
 		/* Client-side QP creation */
 		vrb_prof_func_start("rdma_create_qp");
-		if (rdma_create_qp(ep->id, vrb_ep2_domain(ep)->pd, &attr)) {
+		ret = rdma_create_qp(ep->id, vrb_ep2_domain(ep)->pd, &attr);
+		if (getenv("RXM_DBG"))
+			fprintf(stderr, "[VRB_DBG pid=%d] rdma_create_qp ep=%p id=%p ret=%d errno=%d qp=%p\n",
+				(int) getpid(), (void*)ep, (void*)ep->id,
+				ret, errno, (void*)(ep->id ? ep->id->qp : NULL));
+		if (ret) {
 			ep->state = VRB_DISCONNECTED;
 			ret = -errno;
 			VRB_WARN(FI_LOG_EP_CTRL,
