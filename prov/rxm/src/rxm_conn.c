@@ -367,40 +367,62 @@ int rxm_lazy_connect(struct rxm_conn *conn, uint8_t idx)
 	RXM_DBG("lazy_connect ENTER conn=%p idx=%u num_eps=%u state[idx]=%d",
 		(void*)conn, idx, conn->num_msg_eps, conn->states[idx]);
 
-	info = conn->ep->msg_info;
-	info->dest_addrlen = conn->ep->msg_info->src_addrlen;
-	free(info->dest_addr);
-	info->dest_addr = mem_dup(&conn->peer->addr, info->dest_addrlen);
-	if (!info->dest_addr) {
+	/* Per-ep deep-copied info: ep 0's connect mutated msg_info->dest_addr
+	 * and the verbs core may stash residual CM state on the shared struct
+	 * (handle, src_addr ownership) that confuses a second active connect
+	 * to the same peer. Each lazy connect starts from a fresh dup. */
+	info = fi_dupinfo(conn->ep->msg_info);
+	if (!info) {
 		ret = -FI_ENOMEM;
 		goto truncate;
 	}
 
+	/* The active side must not carry a passive-ep / connreq handle into
+	 * fi_endpoint, or vrb_open_ep takes the wrong creation branch. */
+	info->handle = NULL;
+
+	free(info->dest_addr);
+	info->dest_addrlen = conn->ep->msg_info->src_addrlen;
+	info->dest_addr = mem_dup(&conn->peer->addr, info->dest_addrlen);
+	if (!info->dest_addr) {
+		ret = -FI_ENOMEM;
+		goto free_info;
+	}
+
 	ret = rxm_open_msg_ep(conn, idx, info);
 	if (ret)
-		goto truncate;
+		goto free_info;
 
 	ret = rxm_init_connect_data(conn, &cm_data);
 	if (ret)
 		goto close_ep;
 	cm_data.connect.ep_idx = idx;
 
+	RXM_DBG("lazy_connect calling fi_connect conn=%p idx=%u msg_ep=%p dest_addrlen=%zu",
+		(void*)conn, idx, (void*)conn->msg_eps[idx],
+		info->dest_addrlen);
 	ret = fi_connect(conn->msg_eps[idx], info->dest_addr, &cm_data,
 			 sizeof(cm_data));
 	if (ret) {
 		RXM_WARN_ERR(FI_LOG_EP_CTRL, "fi_connect (lazy)", ret);
+		RXM_DBG("lazy_connect fi_connect FAILED conn=%p idx=%u ret=%d",
+			(void*)conn, idx, ret);
 		goto close_ep;
 	}
 
 	conn->states[idx] = RXM_CM_CONNECTING;
 	conn->ep->connecting_cnt++;
-	RXM_DBG("lazy_connect FI_CONNECT_SENT conn=%p idx=%u msg_ep=%p ep_idx_in_cm_data=%u",
-		(void*)conn, idx, (void*)conn->msg_eps[idx], cm_data.connect.ep_idx);
+	RXM_DBG("lazy_connect FI_CONNECT_SENT conn=%p idx=%u msg_ep=%p ep_idx_in_cm_data=%u connecting_cnt=%d",
+		(void*)conn, idx, (void*)conn->msg_eps[idx],
+		cm_data.connect.ep_idx, conn->ep->connecting_cnt);
+	fi_freeinfo(info);
 	return 0;
 
 close_ep:
 	fi_close(&conn->msg_eps[idx]->fid);
 	conn->msg_eps[idx] = NULL;
+free_info:
+	fi_freeinfo(info);
 truncate:
 	FI_WARN(&rxm_prov, FI_LOG_EP_CTRL,
 		"lazy connect of ep %u failed (%s); truncating conn %p to %u eps\n",
@@ -1143,14 +1165,26 @@ void rxm_conn_progress(struct rxm_ep *ep)
 	struct rxm_eq_cm_entry cm_entry;
 	uint32_t event;
 	ssize_t ret;
+	static __thread unsigned long progress_calls;
+	static __thread unsigned long progress_calls_connecting;
 
 	assert(ofi_genlock_held(&ep->util_ep.lock));
+	if ((++progress_calls % 100000) == 1)
+		RXM_DBG("conn_progress tick #%lu connecting_cnt=%d",
+			progress_calls, ep->connecting_cnt);
+	if (ep->connecting_cnt > 0 &&
+	    (++progress_calls_connecting % 1000) == 1)
+		RXM_DBG("conn_progress tick_connecting #%lu connecting_cnt=%d",
+			progress_calls_connecting, ep->connecting_cnt);
 	do {
 		ret = fi_eq_read(ep->msg_eq, &event, &cm_entry,
 				 sizeof(cm_entry), 0);
 		if (ret > 0) {
+			RXM_DBG("conn_progress fi_eq_read got event=%u connecting_cnt=%d",
+				event, ep->connecting_cnt);
 			rxm_handle_event(ep, event, &cm_entry, ret);
 		} else if (ret == -FI_EAVAIL) {
+			RXM_DBG("conn_progress fi_eq_read EAVAIL");
 			rxm_handle_error(ep);
 			ret = 1;
 		}
