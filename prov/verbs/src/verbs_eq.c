@@ -972,6 +972,10 @@ vrb_eq_cm_process_event(struct vrb_eq *eq,
 		vrb_prof_func_start("rdma_connect");
 		ret = rdma_connect(ep->id, &ep->conn_param);
 		vrb_prof_func_end("rdma_connect");
+		if (getenv("RXM_DBG"))
+			fprintf(stderr, "[VRB_DBG pid=%d] ROUTE_RESOLVED -> rdma_connect ep=%p id=%p ret=%d errno=%d cm_priv_len=%u\n",
+				(int) getpid(), (void*)ep, (void*)ep->id, ret, errno,
+				ep->conn_param.private_data_len);
 		if (!ret && ep->profile)
 			vrb_prof_cntr_inc(ep->profile, FI_VAR_CONN_REQUEST);
 
