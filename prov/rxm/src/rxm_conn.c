@@ -196,6 +196,10 @@ static int rxm_open_msg_ep(struct rxm_conn *conn, uint8_t idx,
 	ep = conn->ep;
 	domain = container_of(ep->util_ep.domain, struct rxm_domain,
 			      util_domain);
+	RXM_DBG("open_msg_ep ENTER idx=%u msg_info=%p handle=%p src_addr=%p dest_addr=%p src_addrlen=%zu dest_addrlen=%zu",
+		idx, (void*)msg_info, (void*)msg_info->handle,
+		(void*)msg_info->src_addr, (void*)msg_info->dest_addr,
+		msg_info->src_addrlen, msg_info->dest_addrlen);
 	ret = fi_endpoint(domain->msg_domain, msg_info, &msg_ep, conn);
 	if (ret) {
 		RXM_WARN_ERR(FI_LOG_EP_CTRL, "fi_endpoint", ret);
@@ -335,6 +339,18 @@ static int rxm_send_connect(struct rxm_conn *conn)
 	if (ret)
 		goto err;
 
+	{
+		const struct sockaddr_in *sin_dst = (const struct sockaddr_in *) info->dest_addr;
+		const struct sockaddr_in *sin_src = (const struct sockaddr_in *) info->src_addr;
+		RXM_DBG("send_connect EP0 calling fi_connect conn=%p src_addrlen=%zu dest_addrlen=%zu src_fam=%u src_port=%u dst_fam=%u dst_port=%u dst_ip=0x%08x",
+			(void*)conn,
+			info->src_addrlen, info->dest_addrlen,
+			sin_src ? sin_src->sin_family : 0,
+			sin_src ? ntohs(sin_src->sin_port) : 0,
+			sin_dst ? sin_dst->sin_family : 0,
+			sin_dst ? ntohs(sin_dst->sin_port) : 0,
+			sin_dst ? ntohl(sin_dst->sin_addr.s_addr) : 0);
+	}
 	ret = fi_connect(conn->msg_eps[0], info->dest_addr, &cm_data,
 			 sizeof(cm_data));
 	if (ret) {
@@ -398,9 +414,18 @@ int rxm_lazy_connect(struct rxm_conn *conn, uint8_t idx)
 		goto close_ep;
 	cm_data.connect.ep_idx = idx;
 
-	RXM_DBG("lazy_connect calling fi_connect conn=%p idx=%u msg_ep=%p dest_addrlen=%zu",
-		(void*)conn, idx, (void*)conn->msg_eps[idx],
-		info->dest_addrlen);
+	{
+		const struct sockaddr_in *sin_dst = (const struct sockaddr_in *) info->dest_addr;
+		const struct sockaddr_in *sin_src = (const struct sockaddr_in *) info->src_addr;
+		RXM_DBG("lazy_connect calling fi_connect conn=%p idx=%u msg_ep=%p src_addrlen=%zu dest_addrlen=%zu src_fam=%u src_port=%u dst_fam=%u dst_port=%u dst_ip=0x%08x",
+			(void*)conn, idx, (void*)conn->msg_eps[idx],
+			info->src_addrlen, info->dest_addrlen,
+			sin_src ? sin_src->sin_family : 0,
+			sin_src ? ntohs(sin_src->sin_port) : 0,
+			sin_dst ? sin_dst->sin_family : 0,
+			sin_dst ? ntohs(sin_dst->sin_port) : 0,
+			sin_dst ? ntohl(sin_dst->sin_addr.s_addr) : 0);
+	}
 	ret = fi_connect(conn->msg_eps[idx], info->dest_addr, &cm_data,
 			 sizeof(cm_data));
 	if (ret) {
