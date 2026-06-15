@@ -161,6 +161,12 @@ vrb_msg_ep_connect(struct fid_ep *ep_fid, const void *addr,
 	struct vrb_cm_data_hdr *cm_hdr;
 	int ret = 0;
 
+	if (getenv("RXM_DBG"))
+		fprintf(stderr, "[VRB_DBG pid=%d] vrb_msg_ep_connect ENTER ep=%p ep->id=%p ep->id->qp=%p ep->state=%d paramlen=%zu\n",
+			(int) getpid(), (void*)ep, (void*)ep->id,
+			(void*)(ep->id ? ep->id->qp : NULL),
+			ep->state, paramlen);
+
 	if (ep->profile)
 		vrb_prof_st_start(ep->profile, ofi_gettime_ns());
 
@@ -203,11 +209,18 @@ vrb_msg_ep_connect(struct fid_ep *ep_fid, const void *addr,
 	}
 
 	ofi_genlock_lock(&vrb_ep2_progress(ep)->ep_lock);
+	if (getenv("RXM_DBG"))
+		fprintf(stderr, "[VRB_DBG pid=%d] vrb_msg_ep_connect about to rdma_resolve_addr ep=%p ep->id=%p ep->state=%d (expect VRB_IDLE=0)\n",
+			(int) getpid(), (void*)ep, (void*)ep->id, ep->state);
 	assert(ep->state == VRB_IDLE);
 	ep->state = VRB_RESOLVE_ADDR;
 	vrb_prof_func_start("rdma_resolve_addr");
-	if (rdma_resolve_addr(ep->id, ep->info_attr.src_addr,
-			      ep->info_attr.dest_addr, VERBS_RESOLVE_TIMEOUT)) {
+	ret = rdma_resolve_addr(ep->id, ep->info_attr.src_addr,
+				ep->info_attr.dest_addr, VERBS_RESOLVE_TIMEOUT);
+	if (getenv("RXM_DBG"))
+		fprintf(stderr, "[VRB_DBG pid=%d] vrb_msg_ep_connect rdma_resolve_addr ret=%d errno=%d ep=%p\n",
+			(int) getpid(), ret, errno, (void*)ep);
+	if (ret) {
 		ret = -errno;
 		VRB_WARN_ERRNO(FI_LOG_EP_CTRL, "rdma_resolve_addr");
 		ofi_straddr_log(&vrb_prov, FI_LOG_WARN, FI_LOG_EP_CTRL,

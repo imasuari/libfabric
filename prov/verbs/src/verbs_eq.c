@@ -933,6 +933,10 @@ vrb_eq_cm_process_event(struct vrb_eq *eq,
 	struct vrb_xrc_ep *xrc_ep;
 
 	assert(ofi_mutex_held(&eq->event_lock));
+	if (getenv("RXM_DBG"))
+		fprintf(stderr, "[VRB_DBG pid=%d] cm_event id=%p ctx=%p event=%d (ADDR_RES=0 ROUTE_RES=2 ESTAB=9 CONNECT_REQ=4 CONNECT_RESP=5 REJECT=8 DISC=10 TIMEWAIT=14 ADDR_ERR=1 ROUTE_ERR=3 CONN_ERR=7 UNREACH=6) status=%d\n",
+			(int) getpid(), (void*)cma_event->id, (void*)fid,
+			cma_event->event, cma_event->status);
 	switch (cma_event->event) {
 	case RDMA_CM_EVENT_ADDR_RESOLVED:
 		ep = container_of(fid, struct vrb_ep, util_ep.ep_fid);
