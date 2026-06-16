@@ -47,6 +47,15 @@
 			(int) getpid(), ##__VA_ARGS__); \
 } while (0)
 
+/* Unconditional probe for the multi-QP "second connect rejected as
+ * duplicate" hypothesis. Distinct grep tag so it survives whatever
+ * FI_LOG_LEVEL / RXM_DBG settings the test environment uses. */
+#define MQPBUG(fmt, ...) do { \
+	fprintf(stderr, "[MQPBUG pid=%d] " fmt "\n", \
+		(int) getpid(), ##__VA_ARGS__); \
+	fflush(stderr); \
+} while (0)
+
 static void rxm_flush_msg_cq(struct rxm_ep *rxm_ep);
 
 
@@ -437,6 +446,8 @@ int rxm_lazy_connect(struct rxm_conn *conn, uint8_t idx)
 
 	conn->states[idx] = RXM_CM_CONNECTING;
 	conn->ep->connecting_cnt++;
+	MQPBUG("SEND_SIDE lazy_connect SENT conn=%p idx=%u ep_idx_in_cm_data=%u",
+	       (void*)conn, idx, cm_data.connect.ep_idx);
 	RXM_DBG("lazy_connect FI_CONNECT_SENT conn=%p idx=%u msg_ep=%p ep_idx_in_cm_data=%u connecting_cnt=%d",
 		(void*)conn, idx, (void*)conn->msg_eps[idx],
 		cm_data.connect.ep_idx, conn->ep->connecting_cnt);
@@ -703,6 +714,10 @@ void rxm_process_connect(struct rxm_eq_cm_entry *cm_entry)
 	RXM_DBG("process_connect FI_CONNECTED conn=%p idx=%d num_eps=%u prev_state=%d",
 		(void*)conn, idx, conn->num_msg_eps,
 		(idx >= 0 && idx < conn->num_msg_eps) ? conn->states[idx] : -99);
+	if (idx > 0)
+		MQPBUG("FI_CONNECTED conn=%p idx=%d prev_state=%d (sibling handshake done)",
+		       (void*)conn, idx,
+		       (idx >= 0 && idx < conn->num_msg_eps) ? conn->states[idx] : -99);
 
 	assert(ofi_genlock_held(&conn->ep->util_ep.lock));
 
@@ -779,6 +794,9 @@ rxm_process_reject(struct rxm_conn *conn, uint8_t idx,
 	}
 
 	if (idx > 0) {
+		MQPBUG("SEND_SIDE sibling reject received conn=%p idx=%u reason=%u state[idx]=%d num_eps=%u",
+		       (void*)conn, idx, reason,
+		       conn->states[idx], conn->num_msg_eps);
 		/* Sibling ep rejected during lazy open — drop it without
 		 * tearing down the conn. Ep 0 is unaffected. */
 		rxm_drop_sibling_ep(conn, idx);
@@ -913,17 +931,46 @@ rxm_process_sibling_connreq(struct rxm_ep *ep,
 	if (!conn || conn->states[0] != RXM_CM_CONNECTED ||
 	    idx >= conn->num_msg_eps ||
 	    conn->states[idx] != RXM_CM_IDLE) {
+		const char *why;
+		int state_idx;
+
+		if (!conn)
+			why = "no_conn";
+		else if (conn->states[0] != RXM_CM_CONNECTED)
+			why = "ep0_not_connected";
+		else if (idx >= conn->num_msg_eps)
+			why = "idx_out_of_range";
+		else if (conn->states[idx] == RXM_CM_CONNECTING)
+			why = "DUPLICATE_already_connecting";
+		else if (conn->states[idx] == RXM_CM_ACCEPTING)
+			why = "DUPLICATE_already_accepting";
+		else if (conn->states[idx] == RXM_CM_CONNECTED)
+			why = "DUPLICATE_already_connected";
+		else
+			why = "state_idx_unexpected";
+
+		state_idx = (conn && idx < conn->num_msg_eps)
+				? conn->states[idx] : -99;
+
+		MQPBUG("RECV_SIDE sibling_connreq REJECT idx=%u why=%s "
+		       "conn=%p states[0]=%d num_eps=%u state[idx]=%d",
+		       idx, why, (void*)conn,
+		       conn ? conn->states[0] : -1,
+		       conn ? conn->num_msg_eps : 0,
+		       state_idx);
+
 		FI_WARN(&rxm_prov, FI_LOG_EP_CTRL,
 			"sibling connreq idx=%u rejected: conn=%p states[0]=%d num_eps=%u\n",
 			idx, conn, conn ? conn->states[0] : -1,
 			conn ? conn->num_msg_eps : 0);
 		RXM_DBG("sibling_connreq REJECT idx=%u conn=%p states[0]=%d num_eps=%u state[idx]=%d",
 			idx, (void*)conn, conn ? conn->states[0] : -1,
-			conn ? conn->num_msg_eps : 0,
-			conn && idx < conn->num_msg_eps ? conn->states[idx] : -99);
+			conn ? conn->num_msg_eps : 0, state_idx);
 		ret = -FI_ENOENT;
 		goto put;
 	}
+	MQPBUG("RECV_SIDE sibling_connreq ACCEPT idx=%u conn=%p num_eps=%u",
+	       idx, (void*)conn, conn->num_msg_eps);
 
 	ret = rxm_open_msg_ep(conn, idx, cm_entry->info);
 	if (ret) {
