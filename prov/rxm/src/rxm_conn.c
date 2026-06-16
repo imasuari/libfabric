@@ -34,22 +34,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <poll.h>
-#include <unistd.h>
-#include <sys/types.h>
 
 #include <ofi.h>
 #include <ofi_util.h>
 #include "rxm.h"
 
-#define RXM_DBG(fmt, ...) do { \
-	if (getenv("RXM_DBG")) \
-		fprintf(stderr, "[RXM_DBG pid=%d] " fmt "\n", \
-			(int) getpid(), ##__VA_ARGS__); \
-} while (0)
-
 /* Unconditional probe for the multi-QP "second connect rejected as
- * duplicate" hypothesis. Distinct grep tag so it survives whatever
- * FI_LOG_LEVEL / RXM_DBG settings the test environment uses. */
+ * duplicate" hypothesis. Distinct grep tag survives whatever
+ * FI_LOG_LEVEL the test environment uses. */
 #define MQPBUG(fmt, ...) do { \
 	fprintf(stderr, "[MQPBUG pid=%d] " fmt "\n", \
 		(int) getpid(), ##__VA_ARGS__); \
@@ -205,10 +197,6 @@ static int rxm_open_msg_ep(struct rxm_conn *conn, uint8_t idx,
 	ep = conn->ep;
 	domain = container_of(ep->util_ep.domain, struct rxm_domain,
 			      util_domain);
-	RXM_DBG("open_msg_ep ENTER idx=%u msg_info=%p handle=%p src_addr=%p dest_addr=%p src_addrlen=%zu dest_addrlen=%zu",
-		idx, (void*)msg_info, (void*)msg_info->handle,
-		(void*)msg_info->src_addr, (void*)msg_info->dest_addr,
-		msg_info->src_addrlen, msg_info->dest_addrlen);
 	ret = fi_endpoint(domain->msg_domain, msg_info, &msg_ep, conn);
 	if (ret) {
 		RXM_WARN_ERR(FI_LOG_EP_CTRL, "fi_endpoint", ret);
@@ -240,14 +228,9 @@ static int rxm_open_msg_ep(struct rxm_conn *conn, uint8_t idx,
 	}
 
 	if (!ep->msg_srx) {
-		RXM_DBG("open_msg_ep idx=%u prepost_recv (no SRX) msg_ep=%p",
-			idx, (void*)msg_ep);
 		ret = rxm_prepost_recv(ep, msg_ep);
 		if (ret)
 			goto err;
-	} else {
-		RXM_DBG("open_msg_ep idx=%u SRX bound (no per-ep prepost) msg_ep=%p msg_srx=%p",
-			idx, (void*)msg_ep, (void*)ep->msg_srx);
 	}
 
 	conn->msg_eps[idx] = msg_ep;
@@ -323,149 +306,66 @@ static int rxm_init_connect_data(struct rxm_conn *conn,
 	return 0;
 }
 
-static int rxm_send_connect(struct rxm_conn *conn)
+int rxm_send_connect(struct rxm_conn *conn, uint8_t idx)
 {
 	union rxm_cm_data cm_data;
 	struct fi_info *info;
 	int ret;
 
-	FI_DBG(&rxm_prov, FI_LOG_EP_CTRL, "connecting %p\n", conn);
+	assert(idx < conn->num_msg_eps);
 	assert(ofi_genlock_held(&conn->ep->util_ep.lock));
+	FI_DBG(&rxm_prov, FI_LOG_EP_CTRL, "connecting %p ep %u\n", conn, idx);
 
 	info = conn->ep->msg_info;
-	info->dest_addrlen = conn->ep->msg_info->src_addrlen;
-
+	info->dest_addrlen = info->src_addrlen;
 	free(info->dest_addr);
-	info->dest_addr = mem_dup(&conn->peer->addr, info->dest_addrlen);
-	if (!info->dest_addr)
-		return -FI_ENOMEM;
-
-	ret = rxm_open_conn(conn, info);
-	if (ret)
-		return ret;
-
-	ret = rxm_init_connect_data(conn, &cm_data);
-	if (ret)
-		goto err;
-
-	{
-		const struct sockaddr_in *sin_dst = (const struct sockaddr_in *) info->dest_addr;
-		const struct sockaddr_in *sin_src = (const struct sockaddr_in *) info->src_addr;
-		RXM_DBG("send_connect EP0 calling fi_connect conn=%p src_addrlen=%zu dest_addrlen=%zu src_fam=%u src_port=%u dst_fam=%u dst_port=%u dst_ip=0x%08x",
-			(void*)conn,
-			info->src_addrlen, info->dest_addrlen,
-			sin_src ? sin_src->sin_family : 0,
-			sin_src ? ntohs(sin_src->sin_port) : 0,
-			sin_dst ? sin_dst->sin_family : 0,
-			sin_dst ? ntohs(sin_dst->sin_port) : 0,
-			sin_dst ? ntohl(sin_dst->sin_addr.s_addr) : 0);
-	}
-	ret = fi_connect(conn->msg_eps[0], info->dest_addr, &cm_data,
-			 sizeof(cm_data));
-	if (ret) {
-		RXM_WARN_ERR(FI_LOG_EP_CTRL, "fi_connect", ret);
-		goto err;
-	}
-	conn->states[0] = RXM_CM_CONNECTING;
-	conn->ep->connecting_cnt++;
-	RXM_DBG("send_connect EP0 sent conn=%p msg_ep=%p num_eps=%u",
-		(void*)conn, (void*)conn->msg_eps[0], conn->num_msg_eps);
-	return 0;
-
-err:
-	if (conn->msg_eps && conn->msg_eps[0])
-		fi_close(&conn->msg_eps[0]->fid);
-	free(conn->msg_eps);
-	conn->msg_eps = NULL;
-	conn->states[0] = RXM_CM_IDLE;
-	return ret;
-}
-
-int rxm_lazy_connect(struct rxm_conn *conn, uint8_t idx)
-{
-	union rxm_cm_data cm_data;
-	struct fi_info *info;
-	int ret;
-
-	assert(idx > 0 && idx < conn->num_msg_eps);
-	assert(ofi_genlock_held(&conn->ep->util_ep.lock));
-	RXM_DBG("lazy_connect ENTER conn=%p idx=%u num_eps=%u state[idx]=%d",
-		(void*)conn, idx, conn->num_msg_eps, conn->states[idx]);
-
-	/* Per-ep deep-copied info: ep 0's connect mutated msg_info->dest_addr
-	 * and the verbs core may stash residual CM state on the shared struct
-	 * (handle, src_addr ownership) that confuses a second active connect
-	 * to the same peer. Each lazy connect starts from a fresh dup. */
-	info = fi_dupinfo(conn->ep->msg_info);
-	if (!info) {
-		ret = -FI_ENOMEM;
-		goto truncate;
-	}
-
-	/* The active side must not carry a passive-ep / connreq handle into
-	 * fi_endpoint, or vrb_open_ep takes the wrong creation branch. */
-	info->handle = NULL;
-
-	free(info->dest_addr);
-	info->dest_addrlen = conn->ep->msg_info->src_addrlen;
 	info->dest_addr = mem_dup(&conn->peer->addr, info->dest_addrlen);
 	if (!info->dest_addr) {
 		ret = -FI_ENOMEM;
-		goto free_info;
+		goto err;
 	}
 
-	ret = rxm_open_msg_ep(conn, idx, info);
+	if (idx == 0)
+		ret = rxm_open_conn(conn, info);
+	else
+		ret = rxm_open_msg_ep(conn, idx, info);
 	if (ret)
-		goto free_info;
+		goto err;
 
 	ret = rxm_init_connect_data(conn, &cm_data);
 	if (ret)
 		goto close_ep;
 	cm_data.connect.ep_idx = idx;
 
-	{
-		const struct sockaddr_in *sin_dst = (const struct sockaddr_in *) info->dest_addr;
-		const struct sockaddr_in *sin_src = (const struct sockaddr_in *) info->src_addr;
-		RXM_DBG("lazy_connect calling fi_connect conn=%p idx=%u msg_ep=%p src_addrlen=%zu dest_addrlen=%zu src_fam=%u src_port=%u dst_fam=%u dst_port=%u dst_ip=0x%08x",
-			(void*)conn, idx, (void*)conn->msg_eps[idx],
-			info->src_addrlen, info->dest_addrlen,
-			sin_src ? sin_src->sin_family : 0,
-			sin_src ? ntohs(sin_src->sin_port) : 0,
-			sin_dst ? sin_dst->sin_family : 0,
-			sin_dst ? ntohs(sin_dst->sin_port) : 0,
-			sin_dst ? ntohl(sin_dst->sin_addr.s_addr) : 0);
-	}
 	ret = fi_connect(conn->msg_eps[idx], info->dest_addr, &cm_data,
 			 sizeof(cm_data));
 	if (ret) {
-		RXM_WARN_ERR(FI_LOG_EP_CTRL, "fi_connect (lazy)", ret);
-		RXM_DBG("lazy_connect fi_connect FAILED conn=%p idx=%u ret=%d",
-			(void*)conn, idx, ret);
+		RXM_WARN_ERR(FI_LOG_EP_CTRL, "fi_connect", ret);
 		goto close_ep;
 	}
-
 	conn->states[idx] = RXM_CM_CONNECTING;
 	conn->ep->connecting_cnt++;
-	MQPBUG("SEND_SIDE lazy_connect SENT conn=%p idx=%u ep_idx_in_cm_data=%u",
-	       (void*)conn, idx, cm_data.connect.ep_idx);
-	RXM_DBG("lazy_connect FI_CONNECT_SENT conn=%p idx=%u msg_ep=%p ep_idx_in_cm_data=%u connecting_cnt=%d",
-		(void*)conn, idx, (void*)conn->msg_eps[idx],
-		cm_data.connect.ep_idx, conn->ep->connecting_cnt);
-	fi_freeinfo(info);
+	if (idx > 0)
+		MQPBUG("SEND_SIDE lazy_connect SENT conn=%p idx=%u ep_idx_in_cm_data=%u",
+		       (void*)conn, idx, cm_data.connect.ep_idx);
 	return 0;
 
 close_ep:
-	fi_close(&conn->msg_eps[idx]->fid);
-	conn->msg_eps[idx] = NULL;
-free_info:
-	fi_freeinfo(info);
-truncate:
-	FI_WARN(&rxm_prov, FI_LOG_EP_CTRL,
-		"lazy connect of ep %u failed (%s); truncating conn %p to %u eps\n",
-		idx, fi_strerror(-ret), conn, idx);
-	RXM_DBG("lazy_connect TRUNCATE conn=%p idx=%u ret=%d",
-		(void*)conn, idx, ret);
-	conn->num_msg_eps = idx;
+	if (idx == 0) {
+		fi_close(&conn->msg_eps[0]->fid);
+		free(conn->msg_eps);
+		conn->msg_eps = NULL;
+	} else {
+		fi_close(&conn->msg_eps[idx]->fid);
+		conn->msg_eps[idx] = NULL;
+	}
+err:
+	if (idx > 0) {
+		FI_WARN(&rxm_prov, FI_LOG_EP_CTRL,
+			"lazy connect of ep %u failed (%s); truncating conn %p to %u eps\n",
+			idx, fi_strerror(-ret), conn, idx);
+		conn->num_msg_eps = idx;
+	}
 	return ret;
 }
 
@@ -477,7 +377,7 @@ static int rxm_connect(struct rxm_conn *conn)
 
 	switch (conn->states[0]) {
 	case RXM_CM_IDLE:
-		ret = rxm_send_connect(conn);
+		ret = rxm_send_connect(conn, 0);
 		if (ret)
 			return ret;
 		break;
@@ -711,13 +611,9 @@ void rxm_process_connect(struct rxm_eq_cm_entry *cm_entry)
 	idx = rxm_get_ep_idx(conn, cm_entry->fid);
 	FI_DBG(&rxm_prov, FI_LOG_EP_CTRL,
 	       "processing connected for handle: %p ep %d\n", conn, idx);
-	RXM_DBG("process_connect FI_CONNECTED conn=%p idx=%d num_eps=%u prev_state=%d",
-		(void*)conn, idx, conn->num_msg_eps,
-		(idx >= 0 && idx < conn->num_msg_eps) ? conn->states[idx] : -99);
 	if (idx > 0)
-		MQPBUG("FI_CONNECTED conn=%p idx=%d prev_state=%d (sibling handshake done)",
-		       (void*)conn, idx,
-		       (idx >= 0 && idx < conn->num_msg_eps) ? conn->states[idx] : -99);
+		MQPBUG("FI_CONNECTED conn=%p idx=%d (sibling handshake done)",
+		       (void*)conn, idx);
 
 	assert(ofi_genlock_held(&conn->ep->util_ep.lock));
 
@@ -739,19 +635,10 @@ void rxm_process_connect(struct rxm_eq_cm_entry *cm_entry)
 	conn->ep->connecting_cnt--;
 	assert(conn->ep->connecting_cnt >= 0);
 	conn->states[idx] = RXM_CM_CONNECTED;
-	RXM_DBG("process_connect CONNECTED conn=%p idx=%d connecting_cnt=%d",
-		(void*)conn, idx, conn->ep->connecting_cnt);
 }
 
-/* Sibling ep (idx > 0) failure that arrived while the ep was still
- * mid-handshake (states[idx] != CONNECTED). Close just that ep and
- * truncate num_msg_eps to drop it and any higher eps from rotation.
- * The conn stays alive on ep 0 and any lower CONNECTED siblings.
- *
- * Caller must already have decided this is a sibling-ep pre-CONNECTED
- * failure; we don't dispatch on idx here. */
 static void
-rxm_drop_sibling_ep(struct rxm_conn *conn, uint8_t idx)
+rxm_drop_secondary_ep(struct rxm_conn *conn, uint8_t idx)
 {
 	assert(idx > 0 && idx < conn->num_msg_eps);
 	assert(conn->states[idx] != RXM_CM_CONNECTED);
@@ -794,12 +681,10 @@ rxm_process_reject(struct rxm_conn *conn, uint8_t idx,
 	}
 
 	if (idx > 0) {
-		MQPBUG("SEND_SIDE sibling reject received conn=%p idx=%u reason=%u state[idx]=%d num_eps=%u",
+		MQPBUG("SEND_SIDE secondary reject received conn=%p idx=%u reason=%u state[idx]=%d num_eps=%u",
 		       (void*)conn, idx, reason,
 		       conn->states[idx], conn->num_msg_eps);
-		/* Sibling ep rejected during lazy open — drop it without
-		 * tearing down the conn. Ep 0 is unaffected. */
-		rxm_drop_sibling_ep(conn, idx);
+		rxm_drop_secondary_ep(conn, idx);
 		return;
 	}
 
@@ -895,107 +780,6 @@ rxm_accept_connreq(struct rxm_conn *conn, uint8_t idx,
 	return ret;
 }
 
-/* Acceptor side of a sibling ep's lazy open: a connreq arrives with
- * ep_idx > 0 for an already-CONNECTED conn. Open the ep, fi_accept,
- * and let rxm_process_connect flip states[idx] = CONNECTED later. No
- * remote_index/pid update — ep 0 already established those.
- *
- * Validation rules: the conn must already exist (we do not create one
- * for a sibling connreq), ep 0 must be CONNECTED (peer must have its
- * own ep 0 up before lazily opening siblings), idx must be in range,
- * and the ep must still be IDLE. Any failure rejects the connreq —
- * the conn itself stays alive on ep 0. */
-static int
-rxm_process_sibling_connreq(struct rxm_ep *ep,
-			    struct rxm_eq_cm_entry *cm_entry, uint8_t idx)
-{
-	union ofi_sock_ip peer_addr;
-	struct util_peer_addr *peer;
-	struct rxm_conn *conn;
-	struct rxm_av *av;
-	int ret;
-
-	RXM_DBG("sibling_connreq ENTER idx=%u", idx);
-	memcpy(&peer_addr, cm_entry->info->dest_addr,
-	       cm_entry->info->dest_addrlen);
-	ofi_addr_set_port(&peer_addr.sa, cm_entry->data.connect.port);
-
-	av = container_of(ep->util_ep.av, struct rxm_av, util_av);
-	peer = util_get_peer(av, &peer_addr, 0);
-	if (!peer) {
-		RXM_DBG("sibling_connreq idx=%u util_get_peer FAILED", idx);
-		return -FI_ENOMEM;
-	}
-
-	conn = ofi_idm_lookup(&ep->conn_idx_map, peer->index);
-	if (!conn || conn->states[0] != RXM_CM_CONNECTED ||
-	    idx >= conn->num_msg_eps ||
-	    conn->states[idx] != RXM_CM_IDLE) {
-		const char *why;
-		int state_idx;
-
-		if (!conn)
-			why = "no_conn";
-		else if (conn->states[0] != RXM_CM_CONNECTED)
-			why = "ep0_not_connected";
-		else if (idx >= conn->num_msg_eps)
-			why = "idx_out_of_range";
-		else if (conn->states[idx] == RXM_CM_CONNECTING)
-			why = "DUPLICATE_already_connecting";
-		else if (conn->states[idx] == RXM_CM_ACCEPTING)
-			why = "DUPLICATE_already_accepting";
-		else if (conn->states[idx] == RXM_CM_CONNECTED)
-			why = "DUPLICATE_already_connected";
-		else
-			why = "state_idx_unexpected";
-
-		state_idx = (conn && idx < conn->num_msg_eps)
-				? conn->states[idx] : -99;
-
-		MQPBUG("RECV_SIDE sibling_connreq REJECT idx=%u why=%s "
-		       "conn=%p states[0]=%d num_eps=%u state[idx]=%d",
-		       idx, why, (void*)conn,
-		       conn ? conn->states[0] : -1,
-		       conn ? conn->num_msg_eps : 0,
-		       state_idx);
-
-		FI_WARN(&rxm_prov, FI_LOG_EP_CTRL,
-			"sibling connreq idx=%u rejected: conn=%p states[0]=%d num_eps=%u\n",
-			idx, conn, conn ? conn->states[0] : -1,
-			conn ? conn->num_msg_eps : 0);
-		RXM_DBG("sibling_connreq REJECT idx=%u conn=%p states[0]=%d num_eps=%u state[idx]=%d",
-			idx, (void*)conn, conn ? conn->states[0] : -1,
-			conn ? conn->num_msg_eps : 0, state_idx);
-		ret = -FI_ENOENT;
-		goto put;
-	}
-	MQPBUG("RECV_SIDE sibling_connreq ACCEPT idx=%u conn=%p num_eps=%u",
-	       idx, (void*)conn, conn->num_msg_eps);
-
-	ret = rxm_open_msg_ep(conn, idx, cm_entry->info);
-	if (ret) {
-		RXM_DBG("sibling_connreq idx=%u open_msg_ep FAILED ret=%d", idx, (int) ret);
-		goto put;
-	}
-
-	ret = rxm_accept_connreq(conn, idx, cm_entry);
-	if (ret) {
-		RXM_DBG("sibling_connreq idx=%u fi_accept FAILED ret=%d", idx, (int) ret);
-		fi_close(&conn->msg_eps[idx]->fid);
-		conn->msg_eps[idx] = NULL;
-		goto put;
-	}
-
-	conn->states[idx] = RXM_CM_ACCEPTING;
-	conn->ep->connecting_cnt++;
-	RXM_DBG("sibling_connreq ACCEPTING conn=%p idx=%u msg_ep=%p connecting_cnt=%d",
-		(void*)conn, idx, (void*)conn->msg_eps[idx],
-		conn->ep->connecting_cnt);
-put:
-	util_put_peer(peer);
-	return ret;
-}
-
 static void
 rxm_process_connreq(struct rxm_ep *ep, struct rxm_eq_cm_entry *cm_entry)
 {
@@ -1003,28 +787,15 @@ rxm_process_connreq(struct rxm_ep *ep, struct rxm_eq_cm_entry *cm_entry)
 	struct util_peer_addr *peer;
 	struct rxm_conn *conn;
 	struct rxm_av *av;
+	uint8_t idx;
 	ssize_t ret;
 	int cmp;
 
 	assert(ofi_genlock_held(&ep->util_ep.lock));
-	RXM_DBG("process_connreq ENTER ep_idx_in_data=%u",
-		cm_entry->data.connect.ep_idx);
-	if (rxm_verify_connreq(ep, &cm_entry->data)) {
-		RXM_DBG("process_connreq verify FAILED ep_idx=%u",
-			cm_entry->data.connect.ep_idx);
+	if (rxm_verify_connreq(ep, &cm_entry->data))
 		goto reject;
-	}
 
-	if (cm_entry->data.connect.ep_idx > 0) {
-		if (rxm_process_sibling_connreq(ep, cm_entry,
-						cm_entry->data.connect.ep_idx)) {
-			RXM_DBG("process_connreq sibling FAILED idx=%u -> reject",
-				cm_entry->data.connect.ep_idx);
-			goto reject;
-		}
-		fi_freeinfo(cm_entry->info);
-		return;
-	}
+	idx = cm_entry->data.connect.ep_idx;
 
 	memcpy(&peer_addr, cm_entry->info->dest_addr,
 	       cm_entry->info->dest_addrlen);
@@ -1037,75 +808,127 @@ rxm_process_connreq(struct rxm_ep *ep, struct rxm_eq_cm_entry *cm_entry)
 		goto reject;
 	}
 
-	conn = rxm_add_conn(ep, peer);
-	if (!conn)
-		goto remove;
+	/* We don't handle simultaneous connects for secondary eps.
+	 * Both sides simply reject (states[idx] != IDLE) and 
+         * rxm_process_reject drops the slot. The conn stays alive on
+	 * its other slots; we just lose this one from rotation. */
+	if (idx > 0) {
+		conn = ofi_idm_lookup(&ep->conn_idx_map, peer->index);
+		if (!conn || conn->states[0] != RXM_CM_CONNECTED ||
+		    idx >= conn->num_msg_eps ||
+		    conn->states[idx] != RXM_CM_IDLE) {
+			const char *why;
+			int state_idx;
 
-	FI_INFO(&rxm_prov, FI_LOG_EP_CTRL, "connreq for %p\n", conn);
-	switch (conn->states[0]) {
-	case RXM_CM_IDLE:
-		break;
-	case RXM_CM_CONNECTING:
-		/* simultaneous connections */
-		cmp = ofi_addr_cmp(&rxm_prov, &peer_addr.sa, &ep->addr.sa);
-		if (cmp < 0) {
-			/* let our request finish */
-			FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
-				"simultaneous, reject peer %p\n", conn);
-			rxm_reject_connreq(ep, cm_entry,
-					   RXM_REJECT_EALREADY);
-			goto put;
-		} else if (cmp > 0) {
-			/* accept peer's request */
-			FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
-				"simultaneous, accept peer %p\n", conn);
-			rxm_close_conn(conn);
-		} else {
-			/* connecting to ourself, create loopback conn */
-			FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
-				"loopback conn %p\n", conn);
-			conn = rxm_alloc_conn(ep, peer);
 			if (!conn)
-				goto remove;
+				why = "no_conn";
+			else if (conn->states[0] != RXM_CM_CONNECTED)
+				why = "ep0_not_connected";
+			else if (idx >= conn->num_msg_eps)
+				why = "idx_out_of_range";
+			else if (conn->states[idx] == RXM_CM_CONNECTING)
+				why = "DUPLICATE_already_connecting";
+			else if (conn->states[idx] == RXM_CM_ACCEPTING)
+				why = "DUPLICATE_already_accepting";
+			else if (conn->states[idx] == RXM_CM_CONNECTED)
+				why = "DUPLICATE_already_connected";
+			else
+				why = "state_idx_unexpected";
 
-			dlist_insert_tail(&conn->loopback_entry, &ep->loopback_list);
+			state_idx = (conn && idx < conn->num_msg_eps)
+					? conn->states[idx] : -99;
+
+			MQPBUG("RECV_SIDE secondary_connreq REJECT idx=%u why=%s "
+			       "conn=%p states[0]=%d num_eps=%u state[idx]=%d",
+			       idx, why, (void*)conn,
+			       conn ? conn->states[0] : -1,
+			       conn ? conn->num_msg_eps : 0,
+			       state_idx);
+
+			FI_WARN(&rxm_prov, FI_LOG_EP_CTRL,
+				"secondary connreq idx=%u rejected: conn=%p states[0]=%d num_eps=%u\n",
+				idx, conn, conn ? conn->states[0] : -1,
+				conn ? conn->num_msg_eps : 0);
+			goto remove;
+		}
+		MQPBUG("RECV_SIDE secondary_connreq ACCEPT idx=%u conn=%p num_eps=%u",
+		       idx, (void*)conn, conn->num_msg_eps);
+	} else {
+		conn = rxm_add_conn(ep, peer);
+		if (!conn)
+			goto remove;
+
+		FI_INFO(&rxm_prov, FI_LOG_EP_CTRL, "connreq for %p\n", conn);
+		switch (conn->states[0]) {
+		case RXM_CM_IDLE:
+			break;
+		case RXM_CM_CONNECTING:
+			/* simultaneous connections */
+			cmp = ofi_addr_cmp(&rxm_prov, &peer_addr.sa, &ep->addr.sa);
+			if (cmp < 0) {
+				/* let our request finish */
+				FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
+					"simultaneous, reject peer %p\n", conn);
+				rxm_reject_connreq(ep, cm_entry,
+						   RXM_REJECT_EALREADY);
+				goto put;
+			} else if (cmp > 0) {
+				/* accept peer's request */
+				FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
+					"simultaneous, accept peer %p\n", conn);
+				rxm_close_conn(conn);
+			} else {
+				/* connecting to ourself, create loopback conn */
+				FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
+					"loopback conn %p\n", conn);
+				conn = rxm_alloc_conn(ep, peer);
+				if (!conn)
+					goto remove;
+
+				dlist_insert_tail(&conn->loopback_entry, &ep->loopback_list);
+				break;
+			}
+			break;
+		case RXM_CM_ACCEPTING:
+		case RXM_CM_CONNECTED:
+			if (conn->remote_pid &&
+			    (conn->remote_pid == rxm_peer_pid(cm_entry->data.connect.
+							      client_conn_id))) {
+				FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
+					"simultaneous, reject peer\n");
+				rxm_reject_connreq(ep, cm_entry,
+						   RXM_REJECT_EALREADY);
+				goto put;
+			} else {
+				FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
+					"old connection exists, replacing %p\n", conn);
+				rxm_close_conn(conn);
+			}
+			break;
+		default:
+			assert(0);
 			break;
 		}
-		break;
-	case RXM_CM_ACCEPTING:
-	case RXM_CM_CONNECTED:
-		if (conn->remote_pid &&
-		    (conn->remote_pid == rxm_peer_pid(cm_entry->data.connect.
-		    				      client_conn_id))) {
-			FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
-				"simultaneous, reject peer\n");
-			rxm_reject_connreq(ep, cm_entry,
-					   RXM_REJECT_EALREADY);
-			goto put;
-		} else {
-			FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
-				"old connection exists, replacing %p\n", conn);
-			rxm_close_conn(conn);
-		}
-		break;
-	default:
-		assert(0);
-		break;
+
+		conn->remote_pid = rxm_peer_pid(cm_entry->data.connect.client_conn_id);
+		conn->remote_index = rxm_peer_index(cm_entry->data.connect.client_conn_id);
 	}
 
-	conn->remote_pid = rxm_peer_pid(cm_entry->data.connect.client_conn_id);
-	conn->remote_index = rxm_peer_index(cm_entry->data.connect.client_conn_id);
-	ret = rxm_open_conn(conn, cm_entry->info);
+	if (idx == 0)
+		ret = rxm_open_conn(conn, cm_entry->info);
+	else
+		ret = rxm_open_msg_ep(conn, idx, cm_entry->info);
 	if (ret)
 		goto free;
 
-	rxm_set_peer_flow_ctrl(conn, cm_entry->data.connect.flow_ctrl);
+	if (idx == 0)
+		rxm_set_peer_flow_ctrl(conn, cm_entry->data.connect.flow_ctrl);
 
-	ret = rxm_accept_connreq(conn, 0, cm_entry);
+	ret = rxm_accept_connreq(conn, idx, cm_entry);
 	if (ret)
 		goto close;
 
-	conn->states[0] = RXM_CM_ACCEPTING;
+	conn->states[idx] = RXM_CM_ACCEPTING;
 	conn->ep->connecting_cnt++;
 put:
 	util_put_peer(peer);
@@ -1113,9 +936,15 @@ put:
 	return;
 
 close:
-	rxm_close_conn(conn);
+	if (idx == 0) {
+		rxm_close_conn(conn);
+	} else {
+		fi_close(&conn->msg_eps[idx]->fid);
+		conn->msg_eps[idx] = NULL;
+	}
 free:
-	rxm_free_conn(conn);
+	if (idx == 0)
+		rxm_free_conn(conn);
 remove:
 	util_put_peer(peer);
 reject:
@@ -1131,16 +960,14 @@ void rxm_process_shutdown(struct rxm_conn *conn, uint8_t idx)
 		"shutdown conn %p ep %u (state %d)\n",
 		conn, idx, conn->states[idx]);
 
+	/* A secondary ep that's still mid-handshake never carried traffic,
+	 * so we can drop it and keep the conn alive. A CONNECTED secondary
+	 * dying is unrecoverable so tear down the conn. */
 	if (idx > 0 && conn->states[idx] != RXM_CM_CONNECTED) {
-		/* Sibling ep died while still handshaking — case A:
-		 * truncate, keep conn alive. */
-		rxm_drop_sibling_ep(conn, idx);
+		rxm_drop_secondary_ep(conn, idx);
 		return;
 	}
 
-	/* Ep 0, or a CONNECTED sibling — case B: tear down the whole
-	 * conn. A peer dropping a CONNECTED sibling mid-flight typically
-	 * signals a real problem worth resetting. */
 	switch (conn->states[0]) {
 	case RXM_CM_IDLE:
 		break;
@@ -1187,18 +1014,13 @@ static void rxm_handle_error(struct rxm_ep *ep)
 	if (!entry.fid || entry.fid->fclass != FI_CLASS_EP)
 		return;
 
-	{
-		struct rxm_conn *conn = entry.fid->context;
-		int idx = rxm_get_ep_idx(conn, entry.fid);
+        struct rxm_conn *conn = entry.fid->context;
+        int idx = rxm_get_ep_idx(conn, entry.fid);
 
-		RXM_DBG("handle_error conn=%p idx=%d err=%d (%s)",
-			(void*)conn, idx, entry.err, fi_strerror(entry.err));
-
-		if (entry.err == ECONNREFUSED)
-			rxm_process_reject(conn, (uint8_t) idx, &entry);
-		else
-			rxm_process_shutdown(conn, (uint8_t) idx);
-	}
+        if (entry.err == ECONNREFUSED)
+                rxm_process_reject(conn, (uint8_t) idx, &entry);
+        else
+                rxm_process_shutdown(conn, (uint8_t) idx);
 }
 
 static void
@@ -1206,8 +1028,6 @@ rxm_handle_event(struct rxm_ep *ep, uint32_t event,
 		 struct rxm_eq_cm_entry *cm_entry, size_t len)
 {
 	assert(ofi_genlock_held(&ep->util_ep.lock));
-	RXM_DBG("handle_event event=%u (CONNREQ=%u CONNECTED=%u SHUTDOWN=%u NOTIFY=%u)",
-		event, FI_CONNREQ, FI_CONNECTED, FI_SHUTDOWN, FI_NOTIFY);
 	switch (event) {
 	case FI_NOTIFY:
 		break;
@@ -1217,14 +1037,12 @@ rxm_handle_event(struct rxm_ep *ep, uint32_t event,
 	case FI_CONNECTED:
 		rxm_process_connect(cm_entry);
 		break;
-	case FI_SHUTDOWN: {
+	case FI_SHUTDOWN:
 		struct rxm_conn *conn = cm_entry->fid->context;
 		int idx = rxm_get_ep_idx(conn, cm_entry->fid);
 
-		RXM_DBG("handle_event SHUTDOWN conn=%p idx=%d", (void*)conn, idx);
 		rxm_process_shutdown(conn, (uint8_t) idx);
 		break;
-	}
 	default:
 		FI_WARN(&rxm_prov, FI_LOG_EP_CTRL,
 			"Unknown event: %u\n", event);
@@ -1237,26 +1055,14 @@ void rxm_conn_progress(struct rxm_ep *ep)
 	struct rxm_eq_cm_entry cm_entry;
 	uint32_t event;
 	ssize_t ret;
-	static __thread unsigned long progress_calls;
-	static __thread unsigned long progress_calls_connecting;
 
 	assert(ofi_genlock_held(&ep->util_ep.lock));
-	if ((++progress_calls % 100000) == 1)
-		RXM_DBG("conn_progress tick #%lu connecting_cnt=%d",
-			progress_calls, ep->connecting_cnt);
-	if (ep->connecting_cnt > 0 &&
-	    (++progress_calls_connecting % 1000) == 1)
-		RXM_DBG("conn_progress tick_connecting #%lu connecting_cnt=%d",
-			progress_calls_connecting, ep->connecting_cnt);
 	do {
 		ret = fi_eq_read(ep->msg_eq, &event, &cm_entry,
 				 sizeof(cm_entry), 0);
 		if (ret > 0) {
-			RXM_DBG("conn_progress fi_eq_read got event=%u connecting_cnt=%d",
-				event, ep->connecting_cnt);
 			rxm_handle_event(ep, event, &cm_entry, ret);
 		} else if (ret == -FI_EAVAIL) {
-			RXM_DBG("conn_progress fi_eq_read EAVAIL");
 			rxm_handle_error(ep);
 			ret = 1;
 		}
