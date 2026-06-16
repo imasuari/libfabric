@@ -268,7 +268,7 @@ static inline int rxm_get_ep_idx(struct rxm_conn *conn, struct fid *fid)
 	return -1;
 }
 
-int rxm_lazy_connect(struct rxm_conn *conn, uint8_t idx);
+int rxm_send_connect(struct rxm_conn *conn, uint8_t idx);
 
 struct rxm_fabric {
 	struct util_fabric util_fabric;
