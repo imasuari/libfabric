@@ -407,6 +407,31 @@ static int rxm_rx_buf_match_msg_id(struct dlist_entry *item, const void *arg)
 	return (msg_id == rx_buf->pkt.ctrl_hdr.msg_id);
 }
 
+/* Drain segments parked on conn->deferred_sar_segments for `msg_id` into
+ * `rx_entry`'s proto_info. Used after a SAR FIRST has just created or
+ * recovered the proto_info, to feed any MIDDLE/LAST segments that raced
+ * ahead of it on a different msg_ep QP. Stops as soon as one parked
+ * segment completes the SAR message; the proto_info is freed there.
+ */
+static void rxm_drain_pending_sar_segments(struct rxm_conn *conn,
+					   struct fi_peer_rx_entry *rx_entry,
+					   uint64_t msg_id)
+{
+	struct rxm_rx_buf *seg;
+	struct dlist_entry *entry;
+
+	dlist_foreach_container_safe(&conn->deferred_sar_segments,
+				     struct rxm_rx_buf, seg,
+				     unexp_entry, entry) {
+		if (!rxm_rx_buf_match_msg_id(&seg->unexp_entry, &msg_id))
+			continue;
+		dlist_remove(&seg->unexp_entry);
+		seg->peer_entry = rx_entry;
+		if (rxm_process_seg_data(seg))
+			break;
+	}
+}
+
 static void rxm_init_sar_proto(struct rxm_rx_buf *rx_buf)
 {
 	struct rxm_proto_info *proto_info;
@@ -482,10 +507,6 @@ int rxm_process_seg_data(struct rxm_rx_buf *rx_buf)
 static void rxm_handle_seg_data(struct rxm_rx_buf *rx_buf)
 {
 	struct rxm_proto_info *proto_info;
-	struct fi_peer_rx_entry *rx_entry;
-	struct rxm_conn *conn;
-	uint64_t msg_id;
-	struct dlist_entry *entry;
 
 	if (dlist_empty(&rx_buf->proto_info->sar.pkt_list)) {
 		rxm_process_seg_data(rx_buf);
@@ -499,21 +520,8 @@ static void rxm_handle_seg_data(struct rxm_rx_buf *rx_buf)
 	if ((rxm_sar_get_seg_type(&rx_buf->pkt.ctrl_hdr) == RXM_SAR_SEG_LAST))
 		dlist_remove(&proto_info->sar.entry);
 
-	rx_entry = rx_buf->peer_entry;
-	conn = rx_buf->conn;
-	msg_id = rx_buf->pkt.ctrl_hdr.msg_id;
-
-	dlist_foreach_container_safe(&conn->deferred_sar_segments,
-				     struct rxm_rx_buf, rx_buf,
-				     unexp_entry, entry) {
-		if (!rxm_rx_buf_match_msg_id(&rx_buf->unexp_entry, &msg_id))
-			continue;
-
-		dlist_remove(&rx_buf->unexp_entry);
-		rx_buf->peer_entry = rx_entry;
-		if (rxm_process_seg_data(rx_buf))
-			break;
-	}
+	rxm_drain_pending_sar_segments(rx_buf->conn, rx_buf->peer_entry,
+				       rx_buf->pkt.ctrl_hdr.msg_id);
 }
 
 ssize_t rxm_handle_unexp_sar(struct fi_peer_rx_entry *peer_entry)
@@ -847,8 +855,18 @@ static ssize_t rxm_handle_recv_comp(struct rxm_rx_buf *rx_buf)
 	}
 	rx_buf->peer_entry = rx_entry;
 
-	if (rx_buf->pkt.ctrl_hdr.type == rxm_ctrl_seg)
+	if (rx_buf->pkt.ctrl_hdr.type == rxm_ctrl_seg) {
+		assert(rxm_sar_get_seg_type(&rx_buf->pkt.ctrl_hdr) ==
+		       RXM_SAR_SEG_FIRST);
 		rxm_init_sar_proto(rx_buf);
+		/* MIDDLE/LAST segments that raced ahead of this FIRST on a
+		 * different msg_ep QP are parked on deferred_sar_segments by
+		 * rxm_sar_handle_segment. Drain them now that the proto_info
+		 * exists.
+		 */
+		rxm_drain_pending_sar_segments(rx_buf->conn, rx_entry,
+					       rx_buf->pkt.ctrl_hdr.msg_id);
+	}
 
 	return rxm_handle_rx_buf(rx_buf);
 }
@@ -878,8 +896,28 @@ static ssize_t rxm_sar_handle_segment(struct rxm_rx_buf *rx_buf)
 	sar_entry = dlist_find_first_match(&rx_buf->conn->deferred_sar_msgs,
 					   rxm_sar_match_msg_id,
 					   &rx_buf->pkt.ctrl_hdr.msg_id);
-	if (!sar_entry)
-		return rxm_handle_recv_comp(rx_buf);
+	if (!sar_entry) {
+		enum rxm_sar_seg_type seg_type =
+			rxm_sar_get_seg_type(&rx_buf->pkt.ctrl_hdr);
+
+		/* FIRST drives normal recv-buffer matching. The drain in
+		 * rxm_handle_recv_comp picks up any MIDDLE/LAST segments
+		 * already parked for this msg_id. */
+		if (seg_type == RXM_SAR_SEG_FIRST)
+			return rxm_handle_recv_comp(rx_buf);
+
+		/* MIDDLE/LAST raced ahead of FIRST on a different msg_ep
+		 * QP. Park the rx_buf on the conn until FIRST creates the
+		 * proto_info; repost a replacement so the QP stays armed. */
+		FI_DBG(&rxm_prov, FI_LOG_CQ,
+		       "SAR seg arrived before FIRST: msg_id=0x%" PRIx64
+		       " seg_type=%d conn=%p; parking\n",
+		       rx_buf->pkt.ctrl_hdr.msg_id, seg_type, rx_buf->conn);
+		dlist_insert_tail(&rx_buf->unexp_entry,
+				  &rx_buf->conn->deferred_sar_segments);
+		rxm_replace_rx_buf(rx_buf);
+		return 0;
+	}
 
 	proto_info = container_of(sar_entry, struct rxm_proto_info, sar.entry);
 	rx_buf->peer_entry = proto_info->sar.rx_entry;
