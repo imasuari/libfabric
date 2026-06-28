@@ -407,15 +407,6 @@ static int rxm_rx_buf_match_msg_id(struct dlist_entry *item, const void *arg)
 	return (msg_id == rx_buf->pkt.ctrl_hdr.msg_id);
 }
 
-static int rxm_sar_match_msg_id(struct dlist_entry *item, const void *arg)
-{
-	uint64_t msg_id = *((uint64_t *) arg);
-	struct rxm_proto_info *proto_info;
-
-	proto_info = container_of(item, struct rxm_proto_info, sar.entry);
-	return (msg_id == proto_info->sar.msg_id);
-}
-
 static void rxm_init_sar_proto(struct rxm_rx_buf *rx_buf)
 {
 	struct rxm_proto_info *proto_info;
@@ -490,22 +481,11 @@ int rxm_process_seg_data(struct rxm_rx_buf *rx_buf)
 
 static void rxm_drain_pending_sar_segments(struct rxm_conn *conn,
 					   struct fi_peer_rx_entry *rx_entry,
+					   struct rxm_proto_info *proto_info,
 					   uint64_t msg_id)
 {
 	struct rxm_rx_buf *seg;
-	struct dlist_entry *entry, *sar_entry;
-	struct rxm_proto_info *proto_info;
-
-	/* Parked segments were enqueued before any proto_info existed for
-	 * this msg_id, so they need both proto_info and peer_entry assigned
-	 * before rxm_process_seg_data is safe to call on them. The proto_info
-	 * lives on conn->deferred_sar_msgs keyed by msg_id; re-lookup rather
-	 * than caching, since a LAST segment in the drain may free it. */
-	sar_entry = dlist_find_first_match(&conn->deferred_sar_msgs,
-					   rxm_sar_match_msg_id, &msg_id);
-	if (!sar_entry)
-		return;
-	proto_info = container_of(sar_entry, struct rxm_proto_info, sar.entry);
+	struct dlist_entry *entry;
 
 	dlist_foreach_container_safe(&conn->deferred_sar_segments,
 				     struct rxm_rx_buf, seg,
@@ -514,6 +494,7 @@ static void rxm_drain_pending_sar_segments(struct rxm_conn *conn,
 			continue;
 		dlist_remove(&seg->unexp_entry);
 		seg->peer_entry = rx_entry;
+		/* proto_info was just allocated by FIRST. */
 		seg->proto_info = proto_info;
 		if (rxm_process_seg_data(seg))
 			break;
@@ -537,7 +518,7 @@ static void rxm_handle_seg_data(struct rxm_rx_buf *rx_buf)
 		dlist_remove(&proto_info->sar.entry);
 
 	rxm_drain_pending_sar_segments(rx_buf->conn, rx_buf->peer_entry,
-				       rx_buf->pkt.ctrl_hdr.msg_id);
+				       proto_info, rx_buf->pkt.ctrl_hdr.msg_id);
 }
 
 ssize_t rxm_handle_unexp_sar(struct fi_peer_rx_entry *peer_entry)
@@ -873,23 +854,29 @@ static ssize_t rxm_handle_recv_comp(struct rxm_rx_buf *rx_buf)
 
 	if (rx_buf->pkt.ctrl_hdr.type == rxm_ctrl_seg) {
 		struct rxm_conn *conn;
+		struct rxm_proto_info *proto_info;
 		uint64_t msg_id;
 
 		rxm_init_sar_proto(rx_buf);
-		/* Process this FIRST segment before draining any parked
-		 * out-of-order segments. rxm_process_seg_data may free
-		 * proto_info if a drained LAST completes the message, so
-		 * the FIRST's data must already be consumed by then.
-		 * rxm_handle_seg_data may free rx_buf, so cache the
-		 * fields we need for the drain. */
+		/* Process FIRST before LAST so proto_info is not freed before use. */
 		conn = rx_buf->conn;
+		proto_info = rx_buf->proto_info;
 		msg_id = rx_buf->pkt.ctrl_hdr.msg_id;
 		rxm_handle_seg_data(rx_buf);
-		rxm_drain_pending_sar_segments(conn, rx_entry, msg_id);
+		rxm_drain_pending_sar_segments(conn, rx_entry, proto_info, msg_id);
 		return 0;
 	}
 
 	return rxm_handle_rx_buf(rx_buf);
+}
+
+static int rxm_sar_match_msg_id(struct dlist_entry *item, const void *arg)
+{
+	uint64_t msg_id = *((uint64_t *) arg);
+	struct rxm_proto_info *proto_info;
+
+	proto_info = container_of(item, struct rxm_proto_info, sar.entry);
+	return (msg_id == proto_info->sar.msg_id);
 }
 
 static ssize_t rxm_sar_handle_segment(struct rxm_rx_buf *rx_buf)
