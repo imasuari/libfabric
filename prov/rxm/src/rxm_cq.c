@@ -431,10 +431,34 @@ static void rxm_init_sar_proto(struct rxm_rx_buf *rx_buf)
 			  &rx_buf->conn->deferred_sar_msgs);
 
 	dlist_init(&proto_info->sar.pkt_list);
-	if (rx_buf->peer_entry->peer_context)
+	if (rx_buf->peer_entry->peer_context) {
+		struct rxm_rx_buf *seg;
+		struct dlist_entry *entry;
+		uint64_t msg_id = rx_buf->pkt.ctrl_hdr.msg_id;
+
 		dlist_insert_tail(&rx_buf->unexp_entry,
 				  &proto_info->sar.pkt_list);
 
+		/* MIDDLE/LAST segments that overtook FIRST on another QP
+		 * are parked on conn->deferred_sar_segments. Splice the
+		 * matching ones onto pkt_list now so rxm_handle_unexp_sar
+		 * drains the whole message once the recv matches. */
+		dlist_foreach_container_safe(
+				&rx_buf->conn->deferred_sar_segments,
+				struct rxm_rx_buf, seg, unexp_entry, entry) {
+			if (!rxm_rx_buf_match_msg_id(&seg->unexp_entry,
+						     &msg_id))
+				continue;
+			dlist_remove(&seg->unexp_entry);
+			seg->peer_entry = rx_buf->peer_entry;
+			seg->proto_info = proto_info;
+			dlist_insert_tail(&seg->unexp_entry,
+					  &proto_info->sar.pkt_list);
+			if (rxm_sar_get_seg_type(&seg->pkt.ctrl_hdr) ==
+			    RXM_SAR_SEG_LAST)
+				dlist_remove(&proto_info->sar.entry);
+		}
+	}
 
 	rx_buf->proto_info = proto_info;
 }
