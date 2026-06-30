@@ -425,6 +425,7 @@ static void rxm_init_sar_proto(struct rxm_rx_buf *rx_buf)
 	proto_info->sar.conn = rx_buf->conn;
 	proto_info->sar.msg_id = rx_buf->pkt.ctrl_hdr.msg_id;
 	proto_info->sar.total_recv_len = 0;
+	proto_info->sar.seg_size = rx_buf->pkt.ctrl_hdr.seg_size;
 	proto_info->sar.rx_entry = rx_buf->peer_entry;
 
 	dlist_insert_tail(&proto_info->sar.entry,
@@ -468,6 +469,7 @@ int rxm_process_seg_data(struct rxm_rx_buf *rx_buf)
 	enum fi_hmem_iface iface;
 	struct rxm_proto_info *proto_info;
 	uint64_t device;
+	size_t dst_offset;
 	ssize_t done_len;
 	int done = 0;
 
@@ -477,18 +479,22 @@ int rxm_process_seg_data(struct rxm_rx_buf *rx_buf)
 					       rx_buf->peer_entry->count,
 					       &device);
 
+	/* Segments may arrive out of order across msg_eps, so place each by
+	 * seg_no using FIRST's seg_size (= sender's rxm_buffer_size). */
+	dst_offset = (size_t) rx_buf->pkt.ctrl_hdr.seg_no *
+		     proto_info->sar.seg_size;
 	done_len = ofi_copy_to_hmem_iov(iface, device,
 					rx_buf->peer_entry->iov,
 					rx_buf->peer_entry->count,
-					proto_info->sar.total_recv_len,
+					dst_offset,
 					rx_buf->pkt.data,
 					rx_buf->pkt.ctrl_hdr.seg_size);
 	assert(done_len == rx_buf->pkt.ctrl_hdr.seg_size);
 
 	proto_info->sar.total_recv_len += done_len;
 
-	if ((rxm_sar_get_seg_type(&rx_buf->pkt.ctrl_hdr) == RXM_SAR_SEG_LAST) ||
-	    (done_len != rx_buf->pkt.ctrl_hdr.seg_size)) {
+	if (proto_info->sar.total_recv_len == rx_buf->pkt.hdr.size ||
+	    done_len != rx_buf->pkt.ctrl_hdr.seg_size) {
 		if (!rx_buf->peer_entry->peer_context)
 			dlist_remove(&proto_info->sar.entry);
 		done_len = proto_info->sar.total_recv_len;

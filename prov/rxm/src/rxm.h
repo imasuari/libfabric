@@ -476,6 +476,7 @@ struct rxm_proto_info {
                 struct dlist_entry pkt_list;
                 struct fi_peer_rx_entry *rx_entry;
                 size_t total_recv_len;
+                size_t seg_size;
                 struct rxm_conn *conn;
                 uint64_t msg_id;
         } sar;
