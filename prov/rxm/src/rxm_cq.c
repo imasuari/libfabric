@@ -540,9 +540,6 @@ static void rxm_handle_seg_data(struct rxm_rx_buf *rx_buf)
 
 	if ((rxm_sar_get_seg_type(&rx_buf->pkt.ctrl_hdr) == RXM_SAR_SEG_LAST))
 		dlist_remove(&proto_info->sar.entry);
-
-	rxm_drain_pending_sar_segments(rx_buf->conn, rx_buf->peer_entry,
-				       proto_info, rx_buf->pkt.ctrl_hdr.msg_id);
 }
 
 ssize_t rxm_handle_unexp_sar(struct fi_peer_rx_entry *peer_entry)
