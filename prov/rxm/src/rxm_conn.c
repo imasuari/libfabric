@@ -612,6 +612,9 @@ void rxm_process_connect(struct rxm_eq_cm_entry *cm_entry)
 	conn->ep->connecting_cnt--;
 	assert(conn->ep->connecting_cnt >= 0);
 	conn->states[idx] = RXM_CM_CONNECTED;
+	FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
+		"RXMDBG CONNECTED conn=%p ep=%d connecting_cnt=%d\n",
+		conn, idx, conn->ep->connecting_cnt);
 }
 
 static void
@@ -657,6 +660,18 @@ rxm_process_reject(struct rxm_conn *conn, uint8_t idx,
 	}
 
 	if (idx > 0) {
+		/* On EALREADY for a secondary slot, the peer is going to
+		 * accept our connreq via their own outbound and send us a
+		 * connreq from their side (simultaneous connect). The reject
+		 * we just received is for our outbound — discard it without
+		 * touching the slot. Either the peer's inbound connreq has
+		 * already moved us to ACCEPTING/CONNECTED, or it is still in
+		 * flight and we must stay in CONNECTING so the upcoming
+		 * connreq handler keeps the EP intact instead of reopening it
+		 * (which would race with the peer's accept).
+		 */
+		if (reason == RXM_REJECT_EALREADY)
+			return;
 		rxm_drop_secondary_ep(conn, idx);
 		return;
 	}
