@@ -524,10 +524,10 @@ rxm_send_common(struct rxm_ep *rxm_ep, struct rxm_conn *rxm_conn,
 		ret = rxm_send_eager(rxm_ep, rxm_conn, iov, desc, count,
 				     context, data, flags, tag, op,
 				     data_len, total_len);
-	} else if (data_len <= rxm_ep->sar_limit) {
-		ret = rxm_send_sar(rxm_ep, rxm_conn, iov, desc, (uint8_t) count,
-				   context, data, flags, tag, op, data_len,
-				   rxm_ep_sar_calc_segs_cnt(rxm_ep, data_len));
+	// } else if (data_len <= rxm_ep->sar_limit) {
+	// 	ret = rxm_send_sar(rxm_ep, rxm_conn, iov, desc, (uint8_t) count,
+	// 			   context, data, flags, tag, op, data_len,
+	// 			   rxm_ep_sar_calc_segs_cnt(rxm_ep, data_len));
 	} else {
 rndv_send:
 		ret = rxm_alloc_rndv_buf(rxm_ep, rxm_conn, context,
