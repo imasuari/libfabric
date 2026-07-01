@@ -188,6 +188,22 @@ static void rxm_cq_write_error_trunc(struct rxm_rx_buf *rx_buf, size_t done_len)
 
 static void rxm_finish_recv(struct rxm_rx_buf *rx_buf, size_t done_len)
 {
+	FI_DBG(&rxm_prov, FI_LOG_CQ,
+	       "SAR_DBG finish_recv ENTER msg_id=0x%" PRIx64
+	       " rx_buf=%p peer_entry=%p done_len=%zu\n",
+	       rx_buf->pkt.ctrl_hdr.msg_id, rx_buf, rx_buf->peer_entry,
+	       done_len);
+	FI_DBG(&rxm_prov, FI_LOG_CQ,
+	       "SAR_DBG finish_recv PEER msg_id=0x%" PRIx64
+	       " peer_entry=%p context=%p msg_size=%zu flags=0x%" PRIx64
+	       " iov0_base=%p iov0_len=%zu count=%zu\n",
+	       rx_buf->pkt.ctrl_hdr.msg_id, rx_buf->peer_entry,
+	       rx_buf->peer_entry->context, rx_buf->peer_entry->msg_size,
+	       rx_buf->peer_entry->flags,
+	       rx_buf->peer_entry->iov ? rx_buf->peer_entry->iov[0].iov_base : NULL,
+	       rx_buf->peer_entry->iov ? rx_buf->peer_entry->iov[0].iov_len : 0,
+	       rx_buf->peer_entry->count);
+
 	if (done_len < rx_buf->pkt.hdr.size) {
 		rxm_cq_write_error_trunc(rx_buf, done_len);
 		goto release;
@@ -203,8 +219,20 @@ static void rxm_finish_recv(struct rxm_rx_buf *rx_buf, size_t done_len)
 	}
 	ofi_ep_peer_rx_cntr_inc(&rx_buf->ep->util_ep, ofi_op_msg);
 release:
+	FI_DBG(&rxm_prov, FI_LOG_CQ,
+	       "SAR_DBG finish_recv FREE_ENTRY msg_id=0x%" PRIx64
+	       " peer_entry=%p\n",
+	       rx_buf->pkt.ctrl_hdr.msg_id, rx_buf->peer_entry);
 	rx_buf->ep->srx->owner_ops->free_entry(rx_buf->peer_entry);
+	FI_DBG(&rxm_prov, FI_LOG_CQ,
+	       "SAR_DBG finish_recv DONE msg_id=0x%" PRIx64 " rx_buf=%p\n",
+	       rx_buf->pkt.ctrl_hdr.msg_id, rx_buf);
+	FI_DBG(&rxm_prov, FI_LOG_CQ,
+	       "SAR_DBG finish_recv BEFORE_FREE rx_buf=%p repost=%d conn=%p\n",
+	       rx_buf, rx_buf->repost, rx_buf->conn);
 	rxm_free_rx_buf(rx_buf);
+	FI_DBG(&rxm_prov, FI_LOG_CQ,
+	       "SAR_DBG finish_recv AFTER_FREE\n");
 }
 
 static void
@@ -425,6 +453,11 @@ static void rxm_init_sar_proto(struct rxm_rx_buf *rx_buf)
 
 	dlist_insert_tail(&proto_info->sar.entry,
 			  &rx_buf->conn->deferred_sar_msgs);
+	FI_DBG(&rxm_prov, FI_LOG_CQ,
+	       "SAR_DBG msgs INSERT conn=%p msg_id=0x%" PRIx64
+	       " proto=%p rx_entry=%p site=init_sar_proto\n",
+	       rx_buf->conn, rx_buf->pkt.ctrl_hdr.msg_id, proto_info,
+	       proto_info->sar.rx_entry);
 
 	dlist_init(&proto_info->sar.pkt_list);
 	if (rx_buf->peer_entry->peer_context)
@@ -465,6 +498,11 @@ int rxm_process_seg_data(struct rxm_rx_buf *rx_buf)
 			dlist_remove(&proto_info->sar.entry);
 		done_len = proto_info->sar.total_recv_len;
 		done = 1;
+		FI_DBG(&rxm_prov, FI_LOG_CQ,
+		       "SAR_DBG proto FREE conn=%p msg_id=0x%" PRIx64
+		       " proto=%p peer_entry=%p site=process_seg_data\n",
+		       rx_buf->conn, rx_buf->pkt.ctrl_hdr.msg_id,
+		       rx_buf->proto_info, rx_buf->peer_entry);
 		ofi_buf_free(rx_buf->proto_info);
 		rxm_finish_recv(rx_buf, done_len);
 	} else {
@@ -525,10 +563,20 @@ ssize_t rxm_handle_unexp_sar(struct fi_peer_rx_entry *peer_entry)
 	rx_buf = (struct rxm_rx_buf *) peer_entry->peer_context;
 	proto_info = rx_buf->proto_info;
 
+	/* Break out after the LAST segment: rxm_process_seg_data(LAST) frees
+	 * proto_info (via ofi_buf_free) and peer_entry (via srx->free_entry),
+	 * so any subsequent access to proto_info->sar.pkt_list or
+	 * peer_entry->peer_context would be a UAF. */
 	while (!dlist_empty(&proto_info->sar.pkt_list)) {
+		bool is_last;
+
 		dlist_pop_front(&proto_info->sar.pkt_list,
 				struct rxm_rx_buf, rx_buf, unexp_entry);
+		is_last = rxm_sar_get_seg_type(&rx_buf->pkt.ctrl_hdr) ==
+			  RXM_SAR_SEG_LAST;
 		rxm_process_seg_data(rx_buf);
+		if (is_last)
+			return FI_SUCCESS;
 	}
 	peer_entry->peer_context = NULL;
 	return FI_SUCCESS;
@@ -940,6 +988,13 @@ static ssize_t rxm_sar_handle_segment(struct rxm_rx_buf *rx_buf)
 	}
 
 	proto_info = container_of(sar_entry, struct rxm_proto_info, sar.entry);
+	FI_DBG(&rxm_prov, FI_LOG_CQ,
+	       "SAR_DBG msgs HIT conn=%p msg_id=0x%" PRIx64
+	       " proto=%p rx_entry=%p seg=%d seg_no=%u site=sar_handle_segment\n",
+	       rx_buf->conn, rx_buf->pkt.ctrl_hdr.msg_id, proto_info,
+	       proto_info->sar.rx_entry,
+	       (int) rxm_sar_get_seg_type(&rx_buf->pkt.ctrl_hdr),
+	       rx_buf->pkt.ctrl_hdr.seg_no);
 	rx_buf->peer_entry = proto_info->sar.rx_entry;
 	rx_buf->proto_info = proto_info;
 	rxm_handle_seg_data(rx_buf);
