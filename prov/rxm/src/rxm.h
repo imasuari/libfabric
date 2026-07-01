@@ -249,6 +249,16 @@ struct rxm_conn {
 	bool flow_ctrl;
 	bool peer_flow_ctrl;
 
+	/* Monotonic per-conn sequence for SAR msg_id. With multiple msg_eps
+	 * per conn, FIRST/MIDDLE/LAST segments can travel on different QPs
+	 * and LAST's local send completion (which frees the FIRST tx_buf
+	 * and thus its bufpool-index-as-msg_id) is not ordered with FIRST's
+	 * arrival on the receiver. Using the tx_buf index as msg_id would
+	 * let the sender reuse it before the receiver finished reassembly,
+	 * aliasing two in-flight SAR messages to the same (conn, msg_id).
+	 */
+	uint64_t sar_tx_seq;
+
 	struct dlist_entry deferred_entry;
 	struct dlist_entry deferred_tx_queue;
 	struct dlist_entry deferred_sar_msgs;
@@ -531,6 +541,13 @@ struct rxm_tx_buf {
 	void *app_context;
 	uint64_t flags;
 
+	/* For SAR MIDDLE/LAST segments: pointer to the FIRST segment's
+	 * tx_buf, so LAST's send completion can free FIRST directly instead
+	 * of looking it up via the packet msg_id (which no longer equals
+	 * FIRST's bufpool index once msg_id is a per-conn sequence).
+	 */
+	struct rxm_tx_buf *first_seg;
+
 	union {
 		struct {
 			struct fid_mr *mr[RXM_IOV_LIMIT];
@@ -606,6 +623,7 @@ struct rxm_deferred_tx_entry {
 		} rndv_write;
 		struct {
 			struct rxm_tx_buf *cur_seg_tx_buf;
+			struct rxm_tx_buf *first_seg;
 			struct {
 				struct iovec iov[RXM_IOV_LIMIT];
 				uint8_t count;
@@ -905,7 +923,8 @@ rxm_send_segment(struct rxm_ep *rxm_ep,
 		 uint64_t tag, uint8_t op, const struct iovec *iov,
 		 uint8_t count, size_t *iov_offset,
 		 struct rxm_tx_buf **out_tx_buf,
-		 enum fi_hmem_iface iface, uint64_t device);
+		 enum fi_hmem_iface iface, uint64_t device,
+		 struct rxm_tx_buf *first_seg);
 ssize_t
 rxm_send_common(struct rxm_ep *rxm_ep, struct rxm_conn *rxm_conn,
 		const struct iovec *iov, void **desc, size_t count,

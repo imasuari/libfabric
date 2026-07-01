@@ -415,11 +415,7 @@ static void
 rxm_ep_sar_tx_cleanup(struct rxm_ep *rxm_ep, struct rxm_conn *rxm_conn,
 		      struct rxm_tx_buf *tx_buf)
 {
-	struct rxm_tx_buf *first_tx_buf;
-
-	first_tx_buf = ofi_bufpool_get_ibuf(rxm_ep->tx_pool,
-					    tx_buf->pkt.ctrl_hdr.msg_id);
-	rxm_free_tx_buf(rxm_ep, first_tx_buf);
+	rxm_free_tx_buf(rxm_ep, tx_buf->first_seg);
 	rxm_free_tx_buf(rxm_ep, tx_buf);
 }
 
@@ -502,7 +498,8 @@ rxm_ep_progress_sar_deferred_segments(struct rxm_deferred_tx_entry *def_tx_entry
 				&def_tx_entry->sar_seg.payload.cur_iov_offset,
 				&def_tx_entry->sar_seg.cur_seg_tx_buf,
 				def_tx_entry->sar_seg.iface,
-				def_tx_entry->sar_seg.device);
+				def_tx_entry->sar_seg.device,
+				def_tx_entry->sar_seg.first_seg);
 		if (ret) {
 			if (ret != -FI_EAGAIN) {
 				rxm_ep_sar_handle_segment_failure(def_tx_entry,

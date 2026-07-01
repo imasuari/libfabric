@@ -461,6 +461,7 @@ rxm_alloc_conn(struct rxm_ep *ep, struct util_peer_addr *peer)
 	conn->flags = 0;
 	conn->flow_ctrl = false;
 	conn->peer_flow_ctrl = false;
+	conn->sar_tx_seq = 0;
 	dlist_init(&conn->deferred_entry);
 	dlist_init(&conn->deferred_tx_queue);
 	dlist_init(&conn->deferred_sar_msgs);

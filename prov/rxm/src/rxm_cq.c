@@ -252,8 +252,6 @@ void rxm_finish_eager_send(struct rxm_ep *rxm_ep, struct rxm_tx_buf *tx_buf)
 static bool rxm_complete_sar(struct rxm_ep *rxm_ep,
 			     struct rxm_tx_buf *tx_buf)
 {
-	struct rxm_tx_buf *first_tx_buf;
-
 	assert(ofi_tx_cq_flags(tx_buf->pkt.hdr.op) & FI_SEND);
 	switch (rxm_sar_get_seg_type(&tx_buf->pkt.ctrl_hdr)) {
 	case RXM_SAR_SEG_FIRST:
@@ -262,9 +260,7 @@ static bool rxm_complete_sar(struct rxm_ep *rxm_ep,
 		rxm_free_tx_buf(rxm_ep, tx_buf);
 		break;
 	case RXM_SAR_SEG_LAST:
-		first_tx_buf = ofi_bufpool_get_ibuf(rxm_ep->tx_pool,
-						tx_buf->pkt.ctrl_hdr.msg_id);
-		rxm_free_tx_buf(rxm_ep, first_tx_buf);
+		rxm_free_tx_buf(rxm_ep, tx_buf->first_seg);
 		rxm_free_tx_buf(rxm_ep, tx_buf);
 		return true;
 	}

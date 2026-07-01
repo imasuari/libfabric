@@ -196,7 +196,8 @@ rxm_init_segment(struct rxm_ep *rxm_ep, struct rxm_conn *rxm_conn,
 		 void *app_context, size_t total_len,
 		 size_t seg_len, size_t seg_no, uint64_t data,
 		 uint64_t flags, uint64_t tag, uint8_t op,
-		 enum rxm_sar_seg_type seg_type, uint64_t *msg_id)
+		 enum rxm_sar_seg_type seg_type, uint64_t *msg_id,
+		 struct rxm_tx_buf *first_seg)
 {
 	struct rxm_tx_buf *tx_buf;
 
@@ -210,9 +211,11 @@ rxm_init_segment(struct rxm_ep *rxm_ep, struct rxm_conn *rxm_conn,
 	rxm_ep_format_tx_buf_pkt(rxm_conn, total_len, op, data, tag, flags,
 				 &tx_buf->pkt);
 	if (seg_type == RXM_SAR_SEG_FIRST) {
-		*msg_id = tx_buf->pkt.ctrl_hdr.msg_id = ofi_buf_index(tx_buf);
+		*msg_id = tx_buf->pkt.ctrl_hdr.msg_id = ++rxm_conn->sar_tx_seq;
+		tx_buf->first_seg = tx_buf;
 	} else {
 		tx_buf->pkt.ctrl_hdr.msg_id = *msg_id;
+		tx_buf->first_seg = first_seg;
 	}
 	tx_buf->pkt.ctrl_hdr.seg_size = (uint16_t) seg_len;
 	tx_buf->pkt.ctrl_hdr.seg_no = (uint32_t) seg_no;
@@ -231,7 +234,8 @@ rxm_send_segment(struct rxm_ep *rxm_ep,
 		 uint64_t tag, uint8_t op, const struct iovec *iov,
 		 uint8_t count, size_t *iov_offset,
 		 struct rxm_tx_buf **out_tx_buf,
-		 enum fi_hmem_iface iface, uint64_t device)
+		 enum fi_hmem_iface iface, uint64_t device,
+		 struct rxm_tx_buf *first_seg)
 {
 	struct rxm_tx_buf *tx_buf;
 	enum rxm_sar_seg_type seg_type = RXM_SAR_SEG_MIDDLE;
@@ -245,7 +249,7 @@ rxm_send_segment(struct rxm_ep *rxm_ep,
 
 	tx_buf = rxm_init_segment(rxm_ep, rxm_conn, app_context,
 				  data_len, seg_len, seg_no, data,
-				  flags, tag, op, seg_type, &msg_id);
+				  flags, tag, op, seg_type, &msg_id, first_seg);
 	if (!tx_buf) {
 		*out_tx_buf = NULL;
 		return -FI_EAGAIN;
@@ -284,7 +288,7 @@ rxm_send_sar(struct rxm_ep *rxm_ep, struct rxm_conn *rxm_conn,
 	first_tx_buf = rxm_init_segment(rxm_ep, rxm_conn, context,
 					data_len, rxm_buffer_size,
 					0, data, flags, tag, op,
-					RXM_SAR_SEG_FIRST, &msg_id);
+					RXM_SAR_SEG_FIRST, &msg_id, NULL);
 	if (!first_tx_buf)
 		return -FI_EAGAIN;
 
@@ -312,7 +316,7 @@ rxm_send_sar(struct rxm_ep *rxm_ep, struct rxm_conn *rxm_conn,
 				       remain_len, msg_id, rxm_buffer_size, i,
 				       segs_cnt, data, flags, tag, op, iov,
 				       count, &iov_offset, &tx_buf, iface,
-				       device);
+				       device, first_tx_buf);
 		if (ret) {
 			if (ret == -FI_EAGAIN)
 				goto defer;
@@ -341,6 +345,7 @@ defer:
 	def_tx->sar_seg.payload.tag = tag;
 	def_tx->sar_seg.payload.data = data;
 	def_tx->sar_seg.cur_seg_tx_buf = tx_buf;
+	def_tx->sar_seg.first_seg = first_tx_buf;
 	def_tx->sar_seg.app_context = context;
 	def_tx->sar_seg.flags = flags;
 	def_tx->sar_seg.op = op;
