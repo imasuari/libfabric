@@ -781,6 +781,39 @@ ssize_t rxm_handle_rx_buf(struct rxm_rx_buf *rx_buf)
 	}
 }
 
+/* SAR segments that arrived on a different msg_ep QP before this message's
+ * FIRST segment were parked on conn->deferred_sar_segments (no proto_info
+ * existed yet). When FIRST takes the unexpected path (recv not yet posted) it
+ * is queued and rxm_handle_recv_comp returns before rxm_drain_pending_sar_
+ * segments would run, so those early segments would be orphaned and the
+ * message truncated. Splice the matching-msg_id segments onto pkt_list (in
+ * arrival order, after FIRST) so rxm_handle_unexp_sar delivers them once the
+ * app posts the recv. */
+static void rxm_move_deferred_sar_segments(struct rxm_rx_buf *first_rx_buf)
+{
+	struct rxm_proto_info *proto_info = first_rx_buf->proto_info;
+	uint64_t msg_id = first_rx_buf->pkt.ctrl_hdr.msg_id;
+	struct rxm_rx_buf *seg;
+	struct dlist_entry *entry;
+
+	if (!proto_info)
+		return;
+
+	dlist_foreach_container_safe(&first_rx_buf->conn->deferred_sar_segments,
+				     struct rxm_rx_buf, seg,
+				     unexp_entry, entry) {
+		if (!rxm_rx_buf_match_msg_id(&seg->unexp_entry, &msg_id))
+			continue;
+		dlist_remove(&seg->unexp_entry);
+		dlist_insert_tail(&seg->unexp_entry, &proto_info->sar.pkt_list);
+		/* A parked LAST never traverses rxm_handle_seg_data, so mirror
+		 * its sar.entry removal here to avoid freeing proto_info while
+		 * it is still linked on conn->deferred_sar_msgs. */
+		if (rxm_sar_get_seg_type(&seg->pkt.ctrl_hdr) == RXM_SAR_SEG_LAST)
+			dlist_remove(&proto_info->sar.entry);
+	}
+}
+
 static inline void rxm_entry_prep_for_queue(struct fi_peer_rx_entry *rx_entry,
 					    struct rxm_rx_buf *rx_buf)
 {
@@ -790,8 +823,10 @@ static inline void rxm_entry_prep_for_queue(struct fi_peer_rx_entry *rx_entry,
 		rx_entry->flags |= FI_REMOTE_CQ_DATA;
 		rx_entry->cq_data = rx_buf->pkt.hdr.data;
 	}
-	if (rx_buf->pkt.ctrl_hdr.type == rxm_ctrl_seg)
+	if (rx_buf->pkt.ctrl_hdr.type == rxm_ctrl_seg) {
 		rxm_init_sar_proto(rx_buf);
+		rxm_move_deferred_sar_segments(rx_buf);
+	}
 	rxm_replace_rx_buf(rx_buf);
 }
 
