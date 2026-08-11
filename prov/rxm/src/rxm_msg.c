@@ -216,6 +216,7 @@ rxm_init_segment(struct rxm_ep *rxm_ep, struct rxm_conn *rxm_conn,
 		/* tx_bufs are recycled without zeroing. */
 		tx_buf->sar.first_seg_done = false;
 		tx_buf->sar.last_seg_done = false;
+		tx_buf->sar.comp_deferred = false;
 	} else {
 		tx_buf->pkt.ctrl_hdr.msg_id = *msg_id;
 	}

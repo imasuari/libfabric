@@ -249,17 +249,31 @@ void rxm_finish_eager_send(struct rxm_ep *rxm_ep, struct rxm_tx_buf *tx_buf)
 	ofi_ep_peer_tx_cntr_inc(&rxm_ep->util_ep, ofi_op_msg);
 }
 
+/* Returns true when the application completion for the whole SAR message is
+ * due now. The message is only done locally once FIRST and LAST have both
+ * completed: with more than one msg_ep, FIRST rides the primary while
+ * MIDDLE/LAST are pinned to another ep, so LAST can complete while FIRST is
+ * still queued in the MSG provider. Writing the completion on LAST alone lets
+ * the application believe the send is done and stop driving progress, the
+ * queued FIRST is never flushed, and the peer waits for seg_no 0 forever.
+ * Whichever of the two completes second writes the completion. defer_comp is
+ * false on the error path, where the error entry is reported immediately.
+ */
 static bool rxm_complete_sar(struct rxm_ep *rxm_ep,
-			     struct rxm_tx_buf *tx_buf)
+			     struct rxm_tx_buf *tx_buf, bool defer_comp)
 {
 	struct rxm_tx_buf *first_tx_buf;
+	bool comp_due;
 
 	assert(ofi_tx_cq_flags(tx_buf->pkt.hdr.op) & FI_SEND);
 	switch (rxm_sar_get_seg_type(&tx_buf->pkt.ctrl_hdr)) {
 	case RXM_SAR_SEG_FIRST:
 		tx_buf->sar.first_seg_done = true;
-		if (tx_buf->sar.last_seg_done)
+		if (tx_buf->sar.last_seg_done) {
+			comp_due = tx_buf->sar.comp_deferred;
 			rxm_free_tx_buf(rxm_ep, tx_buf);
+			return comp_due;
+		}
 		break;
 	case RXM_SAR_SEG_MIDDLE:
 		rxm_free_tx_buf(rxm_ep, tx_buf);
@@ -268,8 +282,10 @@ static bool rxm_complete_sar(struct rxm_ep *rxm_ep,
 		first_tx_buf = ofi_bufpool_get_ibuf(rxm_ep->tx_pool,
 			RXM_SAR_TX_INDEX(tx_buf->pkt.ctrl_hdr.msg_id));
 		rxm_free_tx_buf(rxm_ep, tx_buf);
+		comp_due = first_tx_buf->sar.first_seg_done || !defer_comp;
+		first_tx_buf->sar.comp_deferred = !comp_due;
 		rxm_release_sar_first_tx_buf(rxm_ep, first_tx_buf);
-		return true;
+		return comp_due;
 	}
 
 	return false;
@@ -285,7 +301,7 @@ static void rxm_handle_sar_comp(struct rxm_ep *rxm_ep,
 	comp_flags = ofi_tx_cq_flags(tx_buf->pkt.hdr.op);
 	tx_flags = tx_buf->flags;
 
-	if (!rxm_complete_sar(rxm_ep, tx_buf))
+	if (!rxm_complete_sar(rxm_ep, tx_buf, true))
 		return;
 
 	rxm_cq_write_tx_comp(rxm_ep, comp_flags, app_context, tx_flags);
@@ -1816,7 +1832,7 @@ void rxm_handle_comp_error(struct rxm_ep *rxm_ep)
 		tx_buf = err_entry.op_context;
 		err_entry.op_context = tx_buf->app_context;
 		err_entry.flags = ofi_tx_cq_flags(tx_buf->pkt.hdr.op);
-		if (!rxm_complete_sar(rxm_ep, tx_buf))
+		if (!rxm_complete_sar(rxm_ep, tx_buf, false))
 			return;
 		break;
 	case RXM_RNDV_WRITE:

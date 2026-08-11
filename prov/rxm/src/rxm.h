@@ -547,6 +547,9 @@ struct rxm_tx_buf {
 	struct {
 		bool first_seg_done;
 		bool last_seg_done;
+		/* Set when LAST completed while FIRST was still in flight: the
+		 * application completion is owed and FIRST must write it. */
+		bool comp_deferred;
 	} sar;
 
 	union {
