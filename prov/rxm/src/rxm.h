@@ -556,6 +556,14 @@ struct rxm_rx_buf {
 	struct dlist_entry repost_entry;
 	struct dlist_entry unexp_entry;
 	struct rxm_conn *conn;		/* msg ep data was received on */
+	/* Conn that owns rx_ep, i.e. the one whose msg_eps[] slot rx_ep
+	 * occupies.  Unlike conn, which the data path re-points at the conn
+	 * named by the wire header (rxm_sar_handle_segment()), this stays the
+	 * owner for the life of the buffer, so it is the only thing that can
+	 * answer whether rx_ep is still open.  Unused on the msg_srx path,
+	 * where rx_ep is the shared context and has no owning conn.
+	 */
+	struct rxm_conn *rx_ep_conn;
 	struct fi_peer_rx_entry *peer_entry;
 	struct rxm_proto_info *proto_info;
 	uint64_t comp_flags;
@@ -1015,9 +1023,15 @@ rxm_free_rx_buf(struct rxm_rx_buf *rx_buf)
 		rx_buf->data = &rx_buf->pkt.data;
 	}
 
-	/* Discard rx buffer if the msg ep it was posted to was closed */
+	/* Discard rx buffer if the msg ep it was posted to was closed.  Ask
+	 * the conn that owns rx_ep, not rx_buf->conn: on the SAR path
+	 * rxm_sar_handle_segment() has already re-pointed rx_buf->conn at the
+	 * conn named by the wire header, and rxm_post_recv() does not restore
+	 * it, so for an ep whose owner is not that conn the lookup below would
+	 * miss a perfectly open ep and leak the buffer out of its rx queue.
+	 */
 	if (rx_buf->repost && (rx_buf->ep->msg_srx ||
-	     rxm_get_ep_idx(rx_buf->conn, &rx_buf->rx_ep->fid) >= 0)) {
+	     rxm_get_ep_idx(rx_buf->rx_ep_conn, &rx_buf->rx_ep->fid) >= 0)) {
 		if (rxm_post_recv(rx_buf))
 			RXM_COUNT_WARN(rx_buf->ep->cnt_repost_fail,
 				       "repost failed, buf lost: conn=%p rx_ep=%p",
@@ -1031,16 +1045,22 @@ rxm_free_rx_buf(struct rxm_rx_buf *rx_buf)
 		 * other eps but not the one this buffer was posted to).
 		 */
 		if (rx_buf->repost && !rx_buf->ep->msg_srx) {
-			if (!rx_buf->conn || !rx_buf->conn->msg_eps)
+			if (!rx_buf->rx_ep_conn || !rx_buf->rx_ep_conn->msg_eps)
 				RXM_COUNT_WARN(rx_buf->ep->cnt_discard_closed_conn,
-					       "discard on closed conn=%p rx_ep=%p",
-					       rx_buf->conn, rx_buf->rx_ep);
+					       "discard on closed owner=%p rx_ep=%p",
+					       rx_buf->rx_ep_conn, rx_buf->rx_ep);
 			else
+				/* owner == conn here means the owning conn
+				 * really did lose the slot (the array was
+				 * overwritten); owner != conn means the wire
+				 * header simply named a different conn.
+				 */
 				RXM_COUNT_WARN(rx_buf->ep->cnt_discard_live_conn,
-					       "discard on LIVE conn=%p rx_ep=%p num_eps=%u eps[0]=%p",
-					       rx_buf->conn, rx_buf->rx_ep,
-					       rx_buf->conn->num_msg_eps,
-					       rx_buf->conn->msg_eps[0]);
+					       "discard on LIVE owner=%p conn=%p rx_ep=%p num_eps=%u eps[0]=%p",
+					       rx_buf->rx_ep_conn, rx_buf->conn,
+					       rx_buf->rx_ep,
+					       rx_buf->rx_ep_conn->num_msg_eps,
+					       rx_buf->rx_ep_conn->msg_eps[0]);
 		}
 		ofi_buf_free(rx_buf);
 	}
