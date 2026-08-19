@@ -1836,6 +1836,17 @@ void rxm_handle_comp_error(struct rxm_ep *rxm_ep)
 		 */
 		rx_buf = (struct rxm_rx_buf *) err_entry.op_context;
 		if (!rx_buf->peer_entry) {
+			/* This is the buffer sink the flush/close reorder newly
+			 * exposes: vrb_ep_close() pushes one IBV_WC_WR_FLUSH_ERR
+			 * per posted receive into the shared msg CQ, and those
+			 * rx bufs are freed here without ever passing through
+			 * rxm_free_rx_buf(), so they are never reposted and the
+			 * receive credit they held is never returned.
+			 */
+			RXM_COUNT_WARN(rxm_ep->cnt_flush_err_rx,
+				       "flush_err rx freed: conn=%p rx_ep=%p repost=%d prov_errno=%d",
+				       rx_buf->conn, rx_buf->rx_ep,
+				       (int) rx_buf->repost, err_entry.prov_errno);
 			ofi_buf_free((struct rxm_rx_buf *)err_entry.op_context);
 			return;
 		}
@@ -1998,19 +2009,21 @@ int rxm_post_recv(struct rxm_rx_buf *rx_buf)
 int rxm_prepost_recv(struct rxm_ep *ep, struct fid_ep *rx_ep)
 {
 	struct rxm_rx_buf *rx_buf;
-	static bool budget_logged = false;
 	int ret;
 	size_t i;
 
+#if ENABLE_DEBUG
 	/* The per-ep posted-receive budget: a discard count approaching this
 	 * means the ep has run out of posted receives.
 	 */
+	static bool budget_logged = false;
+
 	if (!budget_logged) {
 		budget_logged = true;
-		FI_WARN(&rxm_prov, FI_LOG_EP_CTRL,
-			"RALPH prepost budget rx_attr->size=%zu per msg ep\n",
-			ep->msg_info->rx_attr->size);
+		RXM_RALPH_PRINT("prepost budget rx_attr->size=%zu per msg ep",
+				ep->msg_info->rx_attr->size);
 	}
+#endif
 
 	for (i = 0; i < ep->msg_info->rx_attr->size; i++) {
 		rx_buf = rxm_rx_buf_alloc(ep, rx_ep);
@@ -2026,6 +2039,35 @@ int rxm_prepost_recv(struct rxm_ep *ep, struct fid_ep *rx_ep)
 	return 0;
 }
 
+#if ENABLE_DEBUG
+/* A rank that hangs is killed by the job time limit, so it never reaches ep
+ * close and a summary printed there would never appear.  Dump the whole counter
+ * set periodically instead: the last heartbeat in the log is the final state of
+ * the stuck rank.  deferred_queue is the discriminator - non-empty forever means
+ * rxm holds transfers it cannot push, i.e. the msg ep is returning -FI_EAGAIN,
+ * i.e. receive-credit starvation; empty forever while the app still waits means
+ * the receiver is missing a segment instead.
+ */
+static void rxm_ralph_heartbeat(struct rxm_ep *ep)
+{
+	if (++ep->cnt_progress % (1 << 20))
+		return;
+
+	RXM_RALPH_PRINT("heartbeat progress=%zu deferred_queue=%s "
+			"discard_live=%zu discard_closed=%zu repost_fail=%zu "
+			"flush_err_rx=%zu close_conn=%zu sar_msgs=%zu "
+			"sar_segs=%zu tx_queue=%zu reuse_simul=%zu "
+			"reuse_repl=%zu",
+			ep->cnt_progress,
+			dlist_empty(&ep->deferred_queue) ? "empty" : "NON-EMPTY",
+			ep->cnt_discard_live_conn, ep->cnt_discard_closed_conn,
+			ep->cnt_repost_fail, ep->cnt_flush_err_rx,
+			ep->cnt_close_conn, ep->cnt_close_sar_msgs,
+			ep->cnt_close_sar_segs, ep->cnt_close_tx_queue,
+			ep->cnt_reuse_simultaneous, ep->cnt_reuse_replacing);
+}
+#endif
+
 void rxm_ep_do_progress(struct util_ep *util_ep)
 {
 	struct rxm_ep *rxm_ep = container_of(util_ep, struct rxm_ep, util_ep);
@@ -2035,6 +2077,10 @@ void rxm_ep_do_progress(struct util_ep *util_ep)
 	size_t comp_read = 0;
 	uint64_t timestamp;
 	ssize_t ret, i, err;
+
+#if ENABLE_DEBUG
+	rxm_ralph_heartbeat(rxm_ep);
+#endif
 
 	do {
 		ret = fi_cq_read(rxm_ep->msg_cq, &comp, 32);

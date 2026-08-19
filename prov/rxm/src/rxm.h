@@ -168,15 +168,41 @@ extern size_t rxm_packet_size;
  * occurrences plus every thousandth one afterwards, so a hot path cannot flood
  * the log.  The hanging rank is killed by the job time limit and never reaches
  * ep close, so these have to be reported per event rather than summarised.
+ *
+ * These write to stderr rather than going through FI_WARN.  FI_LOG_PROV is an
+ * exact provider-name filter and this provider is named "ofi_rxm", so a run
+ * with FI_LOG_PROV=rxm sets disable_logging on rxm and fi_log_enabled() drops
+ * every FI_WARN it makes.  stderr is unfiltered, and the explicit fflush()
+ * matters because a hung rank is killed by the job time limit rather than
+ * exiting.  Compiled in only under --enable-debug, so the release build that
+ * produces the pass/hang result carries no instrumentation and no extra work
+ * on any path.
  */
+#if ENABLE_DEBUG
+
+#include <unistd.h>
+
+#define RXM_RALPH_PRINT(fmt, ...)					\
+	do {								\
+		fprintf(stderr, "RALPH pid=%d " fmt "\n",		\
+			(int) getpid(), __VA_ARGS__);			\
+		fflush(stderr);						\
+	} while (0)
+
 #define RXM_COUNT_WARN(counter, fmt, ...)				\
 	do {								\
 		size_t _cnt = ++(counter);				\
 		if (_cnt <= 5 || _cnt % 1000 == 0)			\
-			FI_WARN(&rxm_prov, FI_LOG_EP_CTRL,		\
-				"RALPH " fmt " [n=%zu]\n",		\
-				__VA_ARGS__, _cnt);			\
+			RXM_RALPH_PRINT(fmt " [n=%zu]",			\
+					__VA_ARGS__, _cnt);		\
 	} while (0)
+
+#else /* ENABLE_DEBUG */
+
+#define RXM_RALPH_PRINT(fmt, ...)		do { } while (0)
+#define RXM_COUNT_WARN(counter, fmt, ...)	((void) sizeof(counter))
+
+#endif /* ENABLE_DEBUG */
 
 #define RXM_GET_PROTO_STATE(context)					\
 	(*(enum rxm_proto_state *)					\
@@ -765,6 +791,8 @@ struct rxm_ep {
 	size_t			cnt_close_tx_queue;
 	size_t			cnt_reuse_simultaneous;
 	size_t			cnt_reuse_replacing;
+	size_t			cnt_flush_err_rx;
+	size_t			cnt_progress;
 };
 
 int rxm_start_listen(struct rxm_ep *ep);
