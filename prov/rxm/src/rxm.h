@@ -164,6 +164,20 @@ extern size_t rxm_packet_size;
 	FI_WARN(&rxm_prov, subsystem, log_str "%s (%d)\n", \
 		fi_strerror((int) -(err)), (int) err)
 
+/* Diagnostic-only event counters.  Increment a counter and log the first few
+ * occurrences plus every thousandth one afterwards, so a hot path cannot flood
+ * the log.  The hanging rank is killed by the job time limit and never reaches
+ * ep close, so these have to be reported per event rather than summarised.
+ */
+#define RXM_COUNT_WARN(counter, fmt, ...)				\
+	do {								\
+		size_t _cnt = ++(counter);				\
+		if (_cnt <= 5 || _cnt % 1000 == 0)			\
+			FI_WARN(&rxm_prov, FI_LOG_EP_CTRL,		\
+				"RALPH " fmt " [n=%zu]\n",		\
+				__VA_ARGS__, _cnt);			\
+	} while (0)
+
 #define RXM_GET_PROTO_STATE(context)					\
 	(*(enum rxm_proto_state *)					\
 	  ((unsigned char *)context + offsetof(struct rxm_buf, state)))
@@ -740,6 +754,17 @@ struct rxm_ep {
 
 	struct rxm_eager_ops	*eager_ops;
 	struct rxm_rndv_ops	*rndv_ops;
+
+	/* Diagnostic-only counters, see RXM_COUNT_WARN */
+	size_t			cnt_discard_closed_conn;
+	size_t			cnt_discard_live_conn;
+	size_t			cnt_repost_fail;
+	size_t			cnt_close_conn;
+	size_t			cnt_close_sar_msgs;
+	size_t			cnt_close_sar_segs;
+	size_t			cnt_close_tx_queue;
+	size_t			cnt_reuse_simultaneous;
+	size_t			cnt_reuse_replacing;
 };
 
 int rxm_start_listen(struct rxm_ep *ep);
@@ -965,8 +990,30 @@ rxm_free_rx_buf(struct rxm_rx_buf *rx_buf)
 	/* Discard rx buffer if the msg ep it was posted to was closed */
 	if (rx_buf->repost && (rx_buf->ep->msg_srx ||
 	     rxm_get_ep_idx(rx_buf->conn, &rx_buf->rx_ep->fid) >= 0)) {
-		rxm_post_recv(rx_buf);
+		if (rxm_post_recv(rx_buf))
+			RXM_COUNT_WARN(rx_buf->ep->cnt_repost_fail,
+				       "repost failed, buf lost: conn=%p rx_ep=%p",
+				       rx_buf->conn, rx_buf->rx_ep);
 	} else {
+		/* A repost=false buffer was handed off by rxm_replace_rx_buf,
+		 * which already posted a replacement, so it is not a lost
+		 * receive.  Only count the buffers the closed-ep test above
+		 * actually rejected, and split them by whether the conn was
+		 * torn down (msg_eps freed) or is still live (msg_eps holds
+		 * other eps but not the one this buffer was posted to).
+		 */
+		if (rx_buf->repost && !rx_buf->ep->msg_srx) {
+			if (!rx_buf->conn || !rx_buf->conn->msg_eps)
+				RXM_COUNT_WARN(rx_buf->ep->cnt_discard_closed_conn,
+					       "discard on closed conn=%p rx_ep=%p",
+					       rx_buf->conn, rx_buf->rx_ep);
+			else
+				RXM_COUNT_WARN(rx_buf->ep->cnt_discard_live_conn,
+					       "discard on LIVE conn=%p rx_ep=%p num_eps=%u eps[0]=%p",
+					       rx_buf->conn, rx_buf->rx_ep,
+					       rx_buf->conn->num_msg_eps,
+					       rx_buf->conn->msg_eps[0]);
+		}
 		ofi_buf_free(rx_buf);
 	}
 }

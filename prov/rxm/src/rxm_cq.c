@@ -1998,8 +1998,19 @@ int rxm_post_recv(struct rxm_rx_buf *rx_buf)
 int rxm_prepost_recv(struct rxm_ep *ep, struct fid_ep *rx_ep)
 {
 	struct rxm_rx_buf *rx_buf;
+	static bool budget_logged = false;
 	int ret;
 	size_t i;
+
+	/* The per-ep posted-receive budget: a discard count approaching this
+	 * means the ep has run out of posted receives.
+	 */
+	if (!budget_logged) {
+		budget_logged = true;
+		FI_WARN(&rxm_prov, FI_LOG_EP_CTRL,
+			"RALPH prepost budget rx_attr->size=%zu per msg ep\n",
+			ep->msg_info->rx_attr->size);
+	}
 
 	for (i = 0; i < ep->msg_info->rx_attr->size; i++) {
 		rx_buf = rxm_rx_buf_alloc(ep, rx_ep);

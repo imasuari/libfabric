@@ -62,6 +62,9 @@ static void rxm_close_conn(struct rxm_conn *conn)
 	FI_DBG(&rxm_prov, FI_LOG_EP_CTRL, "closing conn %p\n", conn);
 
 	assert(ofi_genlock_held(&conn->ep->util_ep.lock));
+	RXM_COUNT_WARN(conn->ep->cnt_close_conn, "close_conn %p num_eps=%u",
+		       conn, conn->num_msg_eps);
+
 	/* All deferred transfers are internally generated */
 	while (!dlist_empty(&conn->deferred_tx_queue)) {
 		tx_entry = container_of(conn->deferred_tx_queue.next,
@@ -97,6 +100,25 @@ static void rxm_close_conn(struct rxm_conn *conn)
 	}
 
 	rxm_flush_msg_cq(conn->ep);
+
+	/* The lists above were just drained.  The flush runs full data-path
+	 * completion processing while the msg eps are still open, so it can put
+	 * entries back onto them; anything non-empty here is state stranded on a
+	 * conn that is about to lose its endpoints.
+	 */
+	if (!dlist_empty(&conn->deferred_sar_msgs))
+		RXM_COUNT_WARN(conn->ep->cnt_close_sar_msgs,
+			       "deferred_sar_msgs re-queued by flush, conn=%p",
+			       conn);
+	if (!dlist_empty(&conn->deferred_sar_segments))
+		RXM_COUNT_WARN(conn->ep->cnt_close_sar_segs,
+			       "deferred_sar_segments re-queued by flush, conn=%p",
+			       conn);
+	if (!dlist_empty(&conn->deferred_tx_queue))
+		RXM_COUNT_WARN(conn->ep->cnt_close_tx_queue,
+			       "deferred_tx_queue re-queued by flush, conn=%p",
+			       conn);
+
 	if (conn->msg_eps) {
 		for (uint8_t i = 0; i < conn->num_msg_eps; i++) {
 			if (conn->msg_eps[i])
@@ -837,10 +859,14 @@ rxm_process_connreq(struct rxm_ep *ep, struct rxm_eq_cm_entry *cm_entry)
 			/* accept peer's request */
 			FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
 				"simultaneous, accept peer %p ep %u\n", conn, idx);
-			if (idx == 0)
+			if (idx == 0) {
+				RXM_COUNT_WARN(ep->cnt_reuse_simultaneous,
+					       "reuse conn %p after simultaneous connect",
+					       conn);
 				rxm_close_conn(conn);
-			else
+			} else {
 				rxm_drop_secondary_ep(conn, idx);
+			}
 		} else if (idx == 0) {
 			/* connecting to ourself, create loopback conn */
 			FI_INFO(&rxm_prov, FI_LOG_EP_CTRL, "loopback conn %p\n", conn);
@@ -874,6 +900,9 @@ rxm_process_connreq(struct rxm_ep *ep, struct rxm_eq_cm_entry *cm_entry)
 		} else {
 			FI_INFO(&rxm_prov, FI_LOG_EP_CTRL,
 				"old connection exists, replacing %p\n", conn);
+			RXM_COUNT_WARN(ep->cnt_reuse_replacing,
+				       "reuse conn %p, replacing old connection",
+				       conn);
 			rxm_close_conn(conn);
 		}
 		break;
